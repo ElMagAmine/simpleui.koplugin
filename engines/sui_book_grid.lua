@@ -966,7 +966,7 @@ function GridRenderer.build(w, ctx, opts)
             local bw = Screen:scaleBySize(3)
             cell_widget = OverlapGroup:new{
                 dimen = Geom:new{ w = cw, h = cell_h },
-                tappable,
+                cell_widget,
                 LineWidget:new{ dimen = Geom:new{ w = cw, h = bw },    background = SUIStyle.COLOR.text_primary },
                 LineWidget:new{ dimen = Geom:new{ w = cw, h = bw },    background = SUIStyle.COLOR.text_primary, overlap_offset = {0, cell_h - bw} },
                 LineWidget:new{ dimen = Geom:new{ w = bw, h = cell_h }, background = SUIStyle.COLOR.text_primary },
