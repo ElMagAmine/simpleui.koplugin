@@ -1214,6 +1214,7 @@ function ScreenWidget:init()
     self._clock_is_wrapped   = nil
     self._clock_pfx          = nil
     self._clock_inner_w      = nil
+    self._clock_live         = nil
     self._overflow_warn_key  = nil
 
     -- Minimal placeholder so patches.lua can call wrapWithNavbar safely.
@@ -2268,6 +2269,7 @@ function ScreenWidget:_updatePage(keep_cache, books_only, stats_only)
     body:clear()
 
     self._clock_body_idx    = nil
+    self._clock_live        = nil
     self._clock_body_ref    = body
     self._stats_mod_slots   = {}
     self._book_mod_slots    = {}
@@ -3678,6 +3680,7 @@ function ScreenWidget:onCloseWidget()
     self._clock_is_wrapped = nil
     self._clock_pfx        = nil
     self._clock_inner_w    = nil
+    self._clock_live       = nil
     self._overflow_warn_key = nil
 
     -- Consumes the "file browser visited" marker; the series grouping module
