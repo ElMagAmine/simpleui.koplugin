@@ -2871,6 +2871,7 @@ function M.applyFirstRunDefaults()
     def("simpleui_fc_cover_mode",       "2_3")
     def("simpleui_fc_subfolder_cover",  true)
     def("simpleui_browsemeta_enabled",  true)
+    def("simpleui_browsemeta_show_empty", false)
 
     -- Titlebar: search visible, browse visible left of menu
     def("simpleui_tb_item_fm_search", true)
