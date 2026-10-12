@@ -222,9 +222,8 @@ function M.navigateTo(fm, mode)
     if fm.updateTitleBarPath then
         pcall(function() fm:updateTitleBarPath(target) end)
     end
-    -- Force the titlebar to re-evaluate the back-button state for page 1.
-    -- onGotoPage triggers _resolveIsSub which re-checks the path-based state,
-    -- ensuring the back button is correct when lock_home_folder is active.
+    -- Re-evaluates the title-bar state for page 1: onGotoPage re-checks the
+    -- path-based back-button state, which depends on lock_home_folder.
     if fc.onGotoPage then
         pcall(function() fc:onGotoPage(1) end)
     end
