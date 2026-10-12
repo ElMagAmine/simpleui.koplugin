@@ -289,6 +289,9 @@ end
 --   date_started, date_finished   "YYYY-MM-DD" strings or nil
 --   exclude_from_goals  true for books left out of the counts
 --   preserved           true for books whose file is gone
+--   manual              true for books entered by hand (no file)
+--   count               number of books a manual entry stands for when it was
+--                       entered as a plain number; nil for any other entry
 -- ---------------------------------------------------------------------------
 local _HISTORY_SCAN_LIMIT = 200   -- books reconciled per routine pass
 
@@ -319,6 +322,25 @@ end
 
 local function _yearOf(stamp)
     return stamp and tonumber(stamp:sub(1, 4)) or nil
+end
+
+--- Year a ledger entry belongs to: its completion year or, for a manual book
+--- with no completion stamp, its start year.
+local function _storedYear(stored)
+    return _yearOf(stored.finished or stored.started)
+end
+
+--- Parses a stamp, "YYYY" or "YYYY-MM-DD". Returns the year, month and day as
+--- numbers (month and day are nil for a year-only stamp), or nil when `stamp`
+--- is not a valid stamp.
+function SP.parseStamp(stamp)
+    if type(stamp) ~= "string" then return nil end
+    if stamp:match("^%d%d%d%d$") then return tonumber(stamp) end
+
+    local y, m, d = stamp:match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
+    y, m, d = tonumber(y), tonumber(m), tonumber(d)
+    if y and m >= 1 and m <= 12 and d >= 1 and d <= 31 then return y, m, d end
+    return nil
 end
 
 local function _isFullDate(stamp)
@@ -459,13 +481,29 @@ local function _isListed(entry, preserve)
     return preserve or not entry.gone
 end
 
-local function _bookEntry(md5, stored)
+local function _manualEntry(id, stored)
+    return {
+        key           = id,
+        title         = stored.title,
+        authors       = stored.authors,
+        year          = _storedYear(stored),
+        date_started  = stored.started,
+        date_finished = stored.finished,
+        manual        = true,
+        count         = stored.count,
+    }
+end
+
+-- `id` is the ledger key: a partial md5, or "manual:..." for a manual entry.
+local function _bookEntry(id, stored)
+    if stored.manual then return _manualEntry(id, stored) end
+
     local entry = {
-        key                = "md5:" .. md5,
+        key                = "md5:" .. id,
         title              = stored.title,
         authors            = stored.authors,
-        md5                = md5,
-        year               = _yearOf(stored.finished),
+        md5                = id,
+        year               = _storedYear(stored),
         exclude_from_goals = stored.excluded,
         preserved          = stored.gone,
     }
@@ -499,7 +537,7 @@ function SP.getFinishedBooks(year)
     local preserve = _finishedBooksStore().preserveGone()
     local books    = {}
     for md5, stored in pairs(ledger.books) do
-        if _isListed(stored, preserve) and (not year or _yearOf(stored.finished) == year) then
+        if _isListed(stored, preserve) and (not year or _storedYear(stored) == year) then
             books[#books + 1] = _bookEntry(md5, stored)
         end
     end
@@ -507,25 +545,46 @@ function SP.getFinishedBooks(year)
     return books
 end
 
+--- Oldest and newest completion year among the listed finished books. The
+--- newest is never earlier than the current year.
+function SP.getFinishedYears()
+    local ledger   = _reconciledLedger()
+    local preserve = _finishedBooksStore().preserveGone()
+    local current  = tonumber(os.date("%Y"))
+    local min_year, max_year = current, current
+    for _, stored in pairs(ledger.books) do
+        local year = _isListed(stored, preserve) and _storedYear(stored)
+        if year then
+            min_year = math.min(min_year, year)
+            max_year = math.max(max_year, year)
+        end
+    end
+    return min_year, max_year
+end
+
 --- Number of books in `books` that count towards totals and goals.
 function SP.countFinished(books)
     local count = 0
     for _, book in ipairs(books) do
-        if not book.exclude_from_goals then count = count + 1 end
+        if not book.exclude_from_goals then count = count + (book.count or 1) end
     end
     return count
 end
 
--- Returns the counts for `year_str` and for all time.
+-- Returns the counts for `year_str` and for all time. Manual books always
+-- count towards their year; they count towards all time only when enabled.
 local function countFinishedBooks(year_str)
-    local ledger   = _reconciledLedger()
-    local preserve = _finishedBooksStore().preserveGone()
-    local year     = tonumber(year_str)
+    local ledger     = _reconciledLedger()
+    local store      = _finishedBooksStore()
+    local preserve   = store.preserveGone()
+    local manual_all = store.manualInAllTime()
+    local year       = tonumber(year_str)
     local in_year, total = 0, 0
     for _, entry in pairs(ledger.books) do
         if not entry.excluded and _isListed(entry, preserve) then
-            total = total + 1
-            if _yearOf(entry.finished) == year then in_year = in_year + 1 end
+            local count = entry.count or 1
+            if manual_all or not entry.manual then total = total + count end
+            if _storedYear(entry) == year then in_year = in_year + count end
         end
     end
     return in_year, total
@@ -649,6 +708,83 @@ function SP.markBooksGone(paths)
     SP.invalidateBooks()
     SP.invalidateStatusCounts()
     _flagScreensStale()
+end
+
+-- ---------------------------------------------------------------------------
+-- Manual books
+--
+-- Books entered by hand live in the ledger as "manual:" entries (see
+-- infra/sui_store). Every change goes through the functions below, which
+-- persist the ledger, drop the cached counts and flag the screens.
+-- ---------------------------------------------------------------------------
+
+local function _commitManual(ledger)
+    _finishedBooksStore().save(ledger)
+    SP.invalidateBooks()
+    _flagScreensStale()
+end
+
+local function _bulkKey(year)
+    return string.format("manual:bulk:%04d", year)
+end
+
+local function _newManualKey(books)
+    local key
+    repeat
+        key = string.format("manual:%x%03x", os.time(), math.random(0, 4095))
+    until not books[key]
+    return key
+end
+
+--- Number of books entered as a plain number for `year` (integer).
+function SP.getManualCount(year)
+    local entry = _loadLedger().books[_bulkKey(year)]
+    return entry and entry.count or 0
+end
+
+--- Total number of books entered by hand, individually or as plain numbers.
+function SP.getManualBookCount()
+    local total = 0
+    for _, stored in pairs(_loadLedger().books) do
+        if stored.manual then total = total + (stored.count or 1) end
+    end
+    return total
+end
+
+--- Sets the number of books entered as a plain number for `year` (integer).
+--- Zero removes the entry.
+function SP.setManualCount(year, count)
+    local ledger = _loadLedger()
+    ledger.books[_bulkKey(year)] = count > 0
+        and { manual = true, count = count, finished = string.format("%04d", year) }
+        or nil
+    _commitManual(ledger)
+end
+
+--- Creates a manual book, or replaces the one stored under `key`. `fields`:
+--- title, authors, started, finished (stamps, either may be nil). Returns
+--- the key of the entry.
+function SP.saveManualBook(key, fields)
+    local ledger = _loadLedger()
+    key = key or _newManualKey(ledger.books)
+    ledger.books[key] = {
+        manual   = true,
+        title    = fields.title,
+        authors  = fields.authors or "",
+        started  = fields.started,
+        finished = fields.finished,
+    }
+    _commitManual(ledger)
+    return key
+end
+
+--- Removes the manual entry stored under `key`; any other key is ignored.
+function SP.removeManualBook(key)
+    local ledger = _loadLedger()
+    local entry  = ledger.books[key]
+    if not (entry and entry.manual) then return end
+    ledger.books[key] = nil
+    _commitManual(ledger)
 end
 
 -- ---------------------------------------------------------------------------

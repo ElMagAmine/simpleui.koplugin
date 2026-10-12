@@ -1163,11 +1163,7 @@ function SimpleUIPlugin:init()
                         text = _("Book statistics"),
                         callback = function()
                             if close_cb then close_cb() end
-                            local ok_sw, SW = pcall(require, "screens/sui_stats_windows")
-                            if ok_sw and SW then
-                                if SW.showLoadingNotice then SW.showLoadingNotice() end
-                                SW.showBookStatsFromFile(file)
-                            end
+                            require("screens/sui_stats_launcher").open("book", { filepath = file })
                         end,
                     }}
                 end

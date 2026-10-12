@@ -208,7 +208,7 @@ end
 --   {
 --     initialised = true,            -- a full reconcile has run
 --     books = {
---       ["<partial md5>"] = {
+--       ["<partial md5>"] = {        -- a book tracked from its sidecar
 --         title, authors   strings
 --         finished         completion date "YYYY-MM-DD", or just "YYYY"
 --                          when only the year is known; nil when unknown
@@ -216,26 +216,55 @@ end
 --         path             last known file path
 --         gone             true once the file no longer exists on the device
 --       },
+--       ["manual:<id>"] = {          -- a book entered by hand
+--         manual           true
+--         title, authors   strings (authors may be empty)
+--         started          start stamp, "YYYY-MM-DD" or "YYYY"; nil when unknown
+--         finished         completion stamp, same formats; nil when unknown
+--       },
+--       ["manual:bulk:<year>"] = {   -- books entered as a plain number
+--         manual           true
+--         count            number of books
+--         finished         "YYYY"
+--       },
 --     },
 --   }
 --
+-- A manual entry has no file, so it is never reconciled and never `gone`. It
+-- belongs to the year of its completion stamp, else of its start stamp.
+--
 -- A table stored under the legacy "simpleui_deleted_books" key is folded in
--- on first load as `gone` entries.
+-- on first load as `gone` entries. A number stored under the legacy
+-- "simpleui_reading_goal_physical" key is folded in as the bulk entry of the
+-- current year.
 --
 -- Public API:
---   FinishedBooks.preserveGone()  → boolean (nil → true, i.e. on by default)
---   FinishedBooks.load()          → ledger table (live reference)
---   FinishedBooks.save(ledger)    → persists the ledger
+--   FinishedBooks.preserveGone()      → boolean (nil → true, i.e. on by default)
+--   FinishedBooks.manualInAllTime()   → boolean (nil → true, i.e. on by default)
+--   FinishedBooks.setManualInAllTime(enabled)
+--   FinishedBooks.load()              → ledger table (live reference)
+--   FinishedBooks.save(ledger)        → persists the ledger
 -- ---------------------------------------------------------------------------
 
-local LEDGER_KEY = "simpleui_finished_books"
-local LEGACY_KEY = "simpleui_deleted_books"
+local LEDGER_KEY          = "simpleui_finished_books"
+local LEGACY_KEY          = "simpleui_deleted_books"
+local LEGACY_PHYSICAL_KEY = "simpleui_reading_goal_physical"
 
 local FinishedBooks = {}
 
 --- Whether finished books whose file is gone still count towards the totals.
 function FinishedBooks.preserveGone()
     return SUISettings:nilOrTrue("simpleui_preserve_deleted_books_in_stats")
+end
+
+--- Whether manual books count towards the all-time total. They always count
+--- towards the year they belong to.
+function FinishedBooks.manualInAllTime()
+    return SUISettings:nilOrTrue("simpleui_manual_books_in_all_time")
+end
+
+function FinishedBooks.setManualInAllTime(enabled)
+    SUISettings:saveSetting("simpleui_manual_books_in_all_time", enabled and true or false)
 end
 
 local function _migrateLegacy(books)
@@ -250,16 +279,32 @@ local function _migrateLegacy(books)
     end
 end
 
+-- Folds the legacy plain count of manually tracked books into the ledger as
+-- the bulk entry of the current year, then drops the legacy key.
+local function _foldLegacyCount(ledger)
+    local legacy = SUISettings:get(LEGACY_PHYSICAL_KEY)
+    if legacy == nil then return end
+
+    local count = math.floor(tonumber(legacy) or 0)
+    if count > 0 then
+        local year = os.date("%Y")
+        ledger.books["manual:bulk:" .. year] = { manual = true, count = count, finished = year }
+        SUISettings:set(LEDGER_KEY, ledger)
+    end
+    SUISettings:del(LEGACY_PHYSICAL_KEY)
+end
+
 --- Returns the ledger, creating it (and migrating legacy data) on first use.
 --- The returned table is the live stored one: mutate it, then save() it.
 function FinishedBooks.load()
     local ledger = SUISettings:get(LEDGER_KEY)
-    if ledger then return ledger end
-
-    ledger = { books = {} }
-    _migrateLegacy(ledger.books)
-    SUISettings:set(LEDGER_KEY, ledger)
-    SUISettings:del(LEGACY_KEY)
+    if not ledger then
+        ledger = { books = {} }
+        _migrateLegacy(ledger.books)
+        SUISettings:set(LEDGER_KEY, ledger)
+        SUISettings:del(LEGACY_KEY)
+    end
+    _foldLegacyCount(ledger)
     return ledger
 end
 
