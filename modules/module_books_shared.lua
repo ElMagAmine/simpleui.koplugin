@@ -520,10 +520,12 @@ local function _sidecarData(fp, verify_file)
     return _loadSidecarData(DS, fp)
 end
 
--- Expose the sidecar cache accessors as part of the module API so that
--- module_stats_provider can share the same cache in countMarkedReadBoth
--- without creating a circular dependency or reaching into internals.
--- These are considered semi-internal (prefix _) but are stable across versions.
+-- Public cache-or-load sidecar accessor, shared with other modules so every
+-- consumer reads the same cached record (see _loadSidecarData for its fields).
+SH.sidecarData = _sidecarData
+
+-- Cache accessors exposed for modules that manage entries directly.
+-- Semi-internal (prefixed _) but stable.
 SH._cacheGet = _cacheGet
 SH._cacheGetRaw = function(fp)
     local e = _sidecar_cache[fp]
