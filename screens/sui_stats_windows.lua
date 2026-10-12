@@ -397,114 +397,71 @@ local function _isValidDateStr(s)
     return true
 end
 
--- Writes summary.modified (and optionally sets status = "complete") to the
--- sidecar, then flushes it.  Invalidates the module_books_shared cache entry
--- so the next homescreen refresh picks up the new value.
-local function _writeSummaryModified(filepath, date_str)
-    if not filepath or not _isValidDateStr(date_str) then return false end
+-- Applies `mutate(summary)` to the sidecar summary of `filepath` and flushes
+-- it, unless `mutate` returns false (nothing to change). The stats provider
+-- is then told the book changed, so the counts, the ledger and the screens
+-- follow the edit.
+local function _updateSummary(filepath, mutate)
+    if not filepath then return false end
     local ok_ds, DocSettings = pcall(require, "docsettings")
     if not ok_ds then return false end
-    local ok_open, ds = pcall(function() return DocSettings:open(filepath) end)
+    local ok_open, ds = pcall(DocSettings.open, DocSettings, filepath)
     if not ok_open or not ds then return false end
+
     local summary = ds:readSetting("summary") or {}
-    summary.modified = date_str
-    summary.date_finished = date_str
-    if summary.status ~= "complete" then
-        summary.status = "complete"
+    if mutate(summary) ~= false then
+        ds:saveSetting("summary", summary)
+        ds:flush()
     end
-    ds:saveSetting("summary", summary)
-    pcall(function() ds:flush() end)
-    pcall(function() ds:close() end)
-    -- Invalidate shared sidecar cache if available.
-    local SH = package.loaded["modules/module_books_shared"]
-    if SH then
-        -- module_books_shared's real API is invalidateSidecarCache(), not
-        -- _cacheInvalidate/_cache (those never existed — this used to be a
-        -- silent no-op, same class of wrong-module-reference bug as the
-        -- Library quick-action series-view fix).
-        if SH.invalidateSidecarCache then
-            SH.invalidateSidecarCache(filepath)
-        end
-    end
+
+    local SP = package.loaded["modules/module_stats_provider"]
+    if SP and SP.bookChanged then SP.bookChanged(filepath) end
     return true
 end
 
--- Writes summary.date_started to the sidecar and flushes it.
--- This is a SimpleUI-only field; KOReader ignores unknown sidecar keys.
+-- Sets the completion date and marks the book complete.
+local function _writeSummaryModified(filepath, date_str)
+    if not _isValidDateStr(date_str) then return false end
+    return _updateSummary(filepath, function(summary)
+        summary.modified      = date_str
+        summary.date_finished = date_str
+        summary.status        = "complete"
+    end)
+end
+
+-- Sets the start date. SimpleUI-only field; KOReader ignores unknown sidecar keys.
 local function _writeSummaryStarted(filepath, date_str)
-    if not filepath or not _isValidDateStr(date_str) then return false end
-    local ok_ds, DocSettings = pcall(require, "docsettings")
-    if not ok_ds then return false end
-    local ok_open, ds = pcall(function() return DocSettings:open(filepath) end)
-    if not ok_open or not ds then return false end
-    local summary = ds:readSetting("summary") or {}
-    summary.date_started = date_str
-    ds:saveSetting("summary", summary)
-    pcall(function() ds:flush() end)
-    pcall(function() ds:close() end)
-    local SH = package.loaded["modules/module_books_shared"]
-    if SH then
-        -- module_books_shared's real API is invalidateSidecarCache(), not
-        -- _cacheInvalidate/_cache (those never existed — this used to be a
-        -- silent no-op, same class of wrong-module-reference bug as the
-        -- Library quick-action series-view fix).
-        if SH.invalidateSidecarCache then
-            SH.invalidateSidecarCache(filepath)
+    if not _isValidDateStr(date_str) then return false end
+    return _updateSummary(filepath, function(summary)
+        summary.date_started = date_str
+    end)
+end
+
+local function _writeSummaryExclude(filepath, excluded)
+    return _updateSummary(filepath, function(summary)
+        summary.exclude_from_goals = excluded and true or nil
+    end)
+end
+
+-- Removes keys from the summary (used by the Reset button to revert to the
+-- DB-derived fallback).
+local function _deleteSummaryFields(filepath, ...)
+    local keys = { ... }
+    return _updateSummary(filepath, function(summary)
+        local changed = false
+        for _, key in ipairs(keys) do
+            if summary[key] ~= nil then
+                summary[key] = nil
+                changed      = true
+            end
         end
-    end
-    return true
+        return changed
+    end)
 end
 
 -- Builds a date range card with independently tappable start/end halves.
 --
 -- Parameters:
--- Writes summary.exclude_from_goals to the sidecar and flushes it.
-local function _writeSummaryExclude(filepath, val)
-    if not filepath then return false end
-    local ok_ds, DocSettings = pcall(require, "docsettings")
-    if not ok_ds then return false end
-    local ok_open, ds = pcall(function() return DocSettings:open(filepath) end)
-    if not ok_open or not ds then return false end
-    local summary = ds:readSetting("summary") or {}
-    summary.exclude_from_goals = val and true or nil
-    ds:saveSetting("summary", summary)
-    pcall(function() ds:flush() end)
-    pcall(function() ds:close() end)
-    local SH = package.loaded["modules/module_books_shared"]
-    if SH then
-        -- module_books_shared's real API is invalidateSidecarCache(), not
-        -- _cacheInvalidate/_cache (those never existed — this used to be a
-        -- silent no-op, same class of wrong-module-reference bug as the
-        -- Library quick-action series-view fix).
-        if SH.invalidateSidecarCache then
-            SH.invalidateSidecarCache(filepath)
-        end
-    end
-    return true
-end
-
--- Removes a single key from summary in the sidecar (sets it to nil).
--- Used by the Reset button to revert to the DB-derived fallback.
-local function _deleteSummaryField(filepath, key)
-    if not filepath or not key then return false end
-    local ok_ds, DocSettings = pcall(require, "docsettings")
-    if not ok_ds then return false end
-    local ok_open, ds = pcall(function() return DocSettings:open(filepath) end)
-    if not ok_open or not ds then return false end
-    local summary = ds:readSetting("summary")
-    if type(summary) == "table" and summary[key] ~= nil then
-        summary[key] = nil
-        ds:saveSetting("summary", summary)
-        pcall(function() ds:flush() end)
-    end
-    pcall(function() ds:close() end)
-    local SH = package.loaded["modules/module_books_shared"]
-    if SH then
-        if SH.invalidateSidecarCache then SH.invalidateSidecarCache(filepath) end
-    end
-    return true
-end
-
 --   inner_w           – full inner width
 --   PAD_H             – horizontal padding (passed in to match caller's layout)
 --   date_start_str    – string to display on the left  (YYYY-MM-DD or "–")
@@ -619,17 +576,14 @@ local function _makeDateCard(inner_w, PAD_H,
     local start_widget = makeSideTappable(
         date_start_str, _("Date started"),
         _writeSummaryStarted,
-        function(fp) _deleteSummaryField(fp, "date_started") end,
+        function(fp) _deleteSummaryFields(fp, "date_started") end,
         original_start_str,
         on_start_saved)
 
     local end_widget = makeSideTappable(
         date_end_str, _("Date finished"),
         _writeSummaryModified,
-        function(fp)
-            _deleteSummaryField(fp, "date_finished")
-            _deleteSummaryField(fp, "modified")
-        end,
+        function(fp) _deleteSummaryFields(fp, "date_finished", "modified") end,
         original_end_str,
         on_end_saved)
 
@@ -1128,11 +1082,6 @@ function StatsWindows.showFinishedBooksDialog(initial_page, scope)
                         local next_val = not book.exclude_from_goals
                         book.exclude_from_goals = next_val and true or nil
                         _writeSummaryExclude(fp, book.exclude_from_goals)
-
-                        -- Force full stats invalidation so homescreen widget / stats provider update
-                        local SP = package.loaded["modules/module_stats_provider"]
-                        if SP and SP.invalidate then SP.invalidate() end
-
                         ctx.repaint()
                     end
                 ),

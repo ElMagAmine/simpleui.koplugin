@@ -2982,7 +2982,7 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
                     local on = SUISettings:nilOrTrue("simpleui_preserve_deleted_books_in_stats")
                     SUISettings:saveSetting("simpleui_preserve_deleted_books_in_stats", not on)
                     local SP = package.loaded["modules/module_stats_provider"]
-                    if SP and SP.invalidate then pcall(SP.invalidate) end
+                    if SP and SP.invalidateBooks then pcall(SP.invalidateBooks) end
                     refreshHomescreen()
                 end,
             },

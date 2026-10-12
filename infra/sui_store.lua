@@ -197,80 +197,77 @@ function SUISettings:iterateKeys()
 end
 
 -- ---------------------------------------------------------------------------
--- DeletedBooks — persistent store for finished books removed from the device.
+-- FinishedBooks — persistent ledger of every finished book.
 --
--- When "Preserve deleted books in statistics" is enabled (default: on) and a
--- book whose summary.status == "complete" is deleted via the KOReader file
--- manager (single file or as part of a folder delete), this module records a
--- minimal entry so the book continues to be counted in books_year /
--- books_total on the homescreen.
+-- The ledger is the source of truth for the "books read" figures: counting
+-- from it needs neither the reading history nor any sidecar access, and a
+-- finished book stays recorded after its file is deleted.
 --
--- Storage: a single key "simpleui_deleted_books" inside the existing
--- sui_settings.lua file.  Value is a table keyed by partial_md5_checksum:
+-- Storage: one key "simpleui_finished_books" inside sui_settings.lua:
 --
 --   {
---     ["<md5>"] = { title = "…", authors = "…", year = 2024 },
---     …
+--     initialised = true,            -- a full reconcile has run
+--     books = {
+--       ["<partial md5>"] = {
+--         title, authors   strings
+--         finished         completion date "YYYY-MM-DD", or just "YYYY"
+--                          when only the year is known; nil when unknown
+--         excluded         true when left out of the totals and goals
+--         path             last known file path
+--         gone             true once the file no longer exists on the device
+--       },
+--     },
 --   }
 --
--- year is the completion year (integer, 0 when unknown) captured at deletion
--- time via the stats provider's finishedYear().
+-- A table stored under the legacy "simpleui_deleted_books" key is folded in
+-- on first load as `gone` entries.
 --
 -- Public API:
---   DeletedBooks.isEnabled()          → boolean (nil → true, i.e. on by default)
---   DeletedBooks.add(md5, title, authors, year)
---   DeletedBooks.removeByMd5(md5)
---   DeletedBooks.getAll()             → table (keyed by md5) or {}
+--   FinishedBooks.preserveGone()  → boolean (nil → true, i.e. on by default)
+--   FinishedBooks.load()          → ledger table (live reference)
+--   FinishedBooks.save(ledger)    → persists the ledger
 -- ---------------------------------------------------------------------------
 
-local STORE_KEY = "simpleui_deleted_books"
+local LEDGER_KEY = "simpleui_finished_books"
+local LEGACY_KEY = "simpleui_deleted_books"
 
-local DeletedBooks = {}
+local FinishedBooks = {}
 
-function DeletedBooks.isEnabled()
+--- Whether finished books whose file is gone still count towards the totals.
+function FinishedBooks.preserveGone()
     return SUISettings:nilOrTrue("simpleui_preserve_deleted_books_in_stats")
 end
 
--- Load the raw store table (always a copy-by-reference of the live data).
-local function _load()
-    return SUISettings:get(STORE_KEY) or {}
+local function _migrateLegacy(books)
+    for md5, stored in pairs(SUISettings:get(LEGACY_KEY) or {}) do
+        local year = tonumber(stored.year)
+        books[md5] = {
+            title    = stored.title or "",
+            authors  = stored.authors or "",
+            finished = year and year > 0 and string.format("%04d", year) or nil,
+            gone     = true,
+        }
+    end
 end
 
--- Persist the store table immediately.
-local function _save(tbl)
-    SUISettings:set(STORE_KEY, tbl)
+--- Returns the ledger, creating it (and migrating legacy data) on first use.
+--- The returned table is the live stored one: mutate it, then save() it.
+function FinishedBooks.load()
+    local ledger = SUISettings:get(LEDGER_KEY)
+    if ledger then return ledger end
+
+    ledger = { books = {} }
+    _migrateLegacy(ledger.books)
+    SUISettings:set(LEDGER_KEY, ledger)
+    SUISettings:del(LEGACY_KEY)
+    return ledger
 end
 
---- Add or update an entry for a deleted finished book.
--- md5     : partial_md5_checksum string (key used by the statistics DB)
--- title   : book title string (may be nil)
--- authors : book authors string (may be nil)
--- year    : integer calendar year when the book was finished
-function DeletedBooks.add(md5, title, authors, year)
-    if not md5 then return end
-    local tbl = _load()
-    tbl[md5] = {
-        title   = title   or "",
-        authors = authors or "",
-        year    = year    or 0,
-    }
-    _save(tbl)
+--- Persists a ledger obtained from load().
+function FinishedBooks.save(ledger)
+    SUISettings:set(LEDGER_KEY, ledger)
 end
 
---- Remove the entry whose key matches md5 (no-op when absent).
-function DeletedBooks.removeByMd5(md5)
-    if not md5 then return end
-    local tbl = _load()
-    if tbl[md5] == nil then return end   -- nothing to do
-    tbl[md5] = nil
-    _save(tbl)
-end
-
---- Return the full store table (keyed by md5).  Empty table when nothing stored.
-function DeletedBooks.getAll()
-    return _load()
-end
-
-SUISettings.DeletedBooks = DeletedBooks
+SUISettings.FinishedBooks = FinishedBooks
 
 return SUISettings

@@ -163,7 +163,11 @@ local CLASSIFY_RULES = {
           "simpleui_monthly_reading_goal_secs", "simpleui_tbr_sort_state",
           "simpleui_tbr_auto_remove_finished",
       },
-      exact    = { simpleui_preserve_deleted_books_in_stats = true, simpleui_deleted_books = true },
+      exact    = {
+          simpleui_preserve_deleted_books_in_stats = true,
+          simpleui_finished_books                  = true,
+          simpleui_deleted_books                   = true,  -- legacy key, folded into the ledger on load
+      },
     },
     { "library",
       prefixes = { "simpleui_fc_", "simpleui_browsemeta_", "simpleui_reader_cover_" },
