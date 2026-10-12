@@ -34,6 +34,7 @@ local TextWidget      = require("ui/widget/textwidget")
 
 local CoverFinder    = require("features/library/sui_cover_finder")
 local CoverWidgets   = require("features/library/sui_cover_widgets")
+local RasterCache    = require("infra/sui_raster_cache")
 local CoverOverrides = require("features/library/sui_cover_overrides")
 local GroupActions   = require("features/library/sui_group_actions")
 
@@ -438,8 +439,7 @@ end
 
 function M.invalidateCache()
     _itc = nil
-    -- Cover rasters (pentagon, checkmark, ribbon, shadow) live in sui_cover_widgets.lua.
-    CoverWidgets.clearRasterCache()
+    RasterCache.clear()
 end
 
 -- Public wrapper for the FileChooser item-table cache invalidation.
@@ -2254,7 +2254,7 @@ function M.uninstall()
 
     CoverFinder.clearCache()
     CoverWidgets.clearLabelMetricsCache()
-    CoverWidgets.clearRasterCache()
+    RasterCache.clear()
 
     local ListMenuItem = _getListMenuItem()
     if ListMenuItem and ListMenuItem._simpleui_lm_patched then

@@ -61,7 +61,6 @@
 --   CoverWidgets.buildQuadCover(item, img_list, border, backing, max_img_w, max_img_h, display)
 --       -- Wraps buildQuadGrid with assembleCoverWidget (mosaic's pile/label/badge).
 --   CoverWidgets.installWidget(item, widget)
---   CoverWidgets.clearRasterCache()
 --   CoverWidgets.clearLabelMetricsCache()
 
 local _  = require("infra/sui_i18n").translate
@@ -88,51 +87,9 @@ local VerticalGroup   = require("ui/widget/verticalgroup")
 local VerticalSpan    = require("ui/widget/verticalspan")
 local SUIStyle        = require("features/sui_style")
 local AAPaint         = require("infra/sui_aa_paint")
+local RasterCache     = require("infra/sui_raster_cache")
 
 local CoverWidgets = {}
-
--- ---------------------------------------------------------------------------
--- Raster cache
--- ---------------------------------------------------------------------------
--- Shapes that depend only on their geometry are rasterised once and blitted on
--- every paint. An entry is a table; its Blitbuffer fields are freed when it is
--- dropped. `build` receives the extra arguments, so callers pass a named
--- builder instead of allocating a closure per paint. Each kind holds at most
--- _RASTER_KIND_MAX entries (shadows vary with every cover size); a full kind
--- is dropped as a whole and refilled on demand.
-
-local _RASTER_KIND_MAX = 128
-
-local _rasters = {}
-
-local function freeRasters(kind)
-    for _, entry in pairs(kind.entries) do
-        for _, field in pairs(entry) do
-            if type(field) == "cdata" then field:free() end
-        end
-    end
-    kind.entries, kind.count = {}, 0
-end
-
-local function cachedRaster(kind_name, key, build, ...)
-    local kind = _rasters[kind_name]
-    if not kind then
-        kind = { entries = {}, count = 0 }
-        _rasters[kind_name] = kind
-    end
-    local entry = kind.entries[key]
-    if not entry then
-        if kind.count >= _RASTER_KIND_MAX then freeRasters(kind) end
-        entry = build(...)
-        kind.entries[key] = entry
-        kind.count = kind.count + 1
-    end
-    return entry
-end
-
-function CoverWidgets.clearRasterCache()
-    for _, kind in pairs(_rasters) do freeRasters(kind) end
-end
 
 -- ---------------------------------------------------------------------------
 -- Shared geometry constants
@@ -163,17 +120,15 @@ local _LABEL_GAP_FRAC   = 0.07
 -- triangular tip.
 
 local function buildPentagonMask(w, h)
-    local mask = Blitbuffer.new(w, h, Blitbuffer.TYPE_BB8)
-    mask:fill(Blitbuffer.COLOR_WHITE)
-    AAPaint.paintDownPentagonFill(mask, 0, 0, w, h, 0, 0, w - 1, h - 1)
-    mask:invertRect(0, 0, w, h)
-    return { bb = mask }
+    return { bb = AAPaint.buildMask(w, h, function(mask)
+        AAPaint.paintDownPentagonFill(mask, 0, 0, w, h, 0, 0, w - 1, h - 1)
+    end) }
 end
 
 -- Paints a filled AA pentagon of size (bw × bh) in `color` at (bx, by) on `bb`.
 local function pentagonPaintRect(bb, bx, by, bw, bh, color)
     if bw <= 0 or bh <= 0 then return end
-    local mask = cachedRaster("pentagon", bw * 4096 + bh, buildPentagonMask, bw, bh).bb
+    local mask = RasterCache.get("pentagon", bw * 4096 + bh, buildPentagonMask, bw, bh).bb
     bb:colorblitFromRGB32(mask, bx, by, 0, 0, bw, bh, color)
 end
 
@@ -191,21 +146,40 @@ local function buildCheckMask(sq)
     local miny = math.floor(math.min(ly0, ly1, ry1) - pad)
     local maxy = math.ceil (math.max(ly0, ly1, ry1) + pad)
     local mw, mh = maxx - minx + 1, maxy - miny + 1
-    local mask = Blitbuffer.new(mw, mh, Blitbuffer.TYPE_BB8)
-    mask:fill(Blitbuffer.COLOR_WHITE)
-    AAPaint.paintCapsule(mask, lx0 - minx, ly0 - miny, lx1 - minx, ly1 - miny, tk, 0, 0, mw - 1, mh - 1)
-    AAPaint.paintCapsule(mask, lx1 - minx, ly1 - miny, rx1 - minx, ry1 - miny, tk, 0, 0, mw - 1, mh - 1)
-    mask:invertRect(0, 0, mw, mh)
+    local mask = AAPaint.buildMask(mw, mh, function(bb)
+        AAPaint.paintCapsule(bb, lx0 - minx, ly0 - miny, lx1 - minx, ly1 - miny, tk, 0, 0, mw - 1, mh - 1)
+        AAPaint.paintCapsule(bb, lx1 - minx, ly1 - miny, rx1 - minx, ry1 - miny, tk, 0, 0, mw - 1, mh - 1)
+    end)
     return { bb = mask, dx = minx, dy = miny }
 end
 
 -- Paints the checkmark of the sq × sq box at (bx, by) in `color` on `bb`.
 local function pentagonPaintCheck(bb, bx, by, sq, color)
     if sq <= 0 then return end
-    local check = cachedRaster("check", sq, buildCheckMask, sq)
+    local check = RasterCache.get("check", sq, buildCheckMask, sq)
     local mask  = check.bb
     bb:colorblitFromRGB32(mask, bx + check.dx, by + check.dy,
         0, 0, mask:getWidth(), mask:getHeight(), color)
+end
+
+-- Largest font size, at most `start_sz` and at least 7, at which `text` fits
+-- in `max_w`. Measured with RenderText (TextWidget:getSize can under-report
+-- bold widths); the entry is cached per (text, face, size, bold, width).
+local function fitFontSize(text, face_name, start_sz, bold, max_w)
+    local font_sz = math.max(7, start_sz)
+    -- TextWidget bold uses FreeType embolden, which widens glyphs beyond the
+    -- regular-face advance reported by sizeUtf8Text, so the measured width is
+    -- scaled up to account for it.
+    local bold_scale = bold and 1.10 or 1.0
+    local screen_w = require("device").screen:getWidth()
+    while font_sz > 7 do
+        local face = Font:getFace(face_name, font_sz)
+        -- sizeUtf8Text(x, width, face, text, kerning, bold)
+        local measured = RenderText:sizeUtf8Text(0, screen_w, face, text, true, bold)
+        if (measured and measured.x or 0) * bold_scale <= max_w then break end
+        font_sz = font_sz - 1
+    end
+    return { size = font_sz }
 end
 
 -- Returns a descriptor table for the progress badge, or nil when too small.
@@ -218,33 +192,15 @@ function CoverWidgets.buildProgressBadgeDesc(eff_size, status, percent_finished,
     local text_color  = dark and SUIStyle.COLOR.surface or SUIStyle.COLOR.text_primary
     local text_widget = nil
     -- Cap label width at 95% of the banner body so "100%" and wide icons
-    -- stay inside the pentagon on small covers. Measure with RenderText
-    -- (TextWidget:getSize can under-report bold widths) and shrink the
-    -- font until the glyph advance fits.
+    -- stay inside the pentagon on small covers.
     local max_text_w  = math.max(1, math.floor(bw * 0.95))
 
     local function fitTextWidget(text, face_name, start_sz, bold)
-        local font_sz = math.max(7, start_sz)
-        -- TextWidget bold uses FreeType embolden, which widens glyphs beyond
-        -- the regular-face advance reported by sizeUtf8Text. Scale the
-        -- measured width up so the fit accounts for that.
-        local bold_scale = bold and 1.10 or 1.0
-        local Screen = require("device").screen
-        while font_sz > 7 do
-            local face = Font:getFace(face_name, font_sz)
-            -- sizeUtf8Text(x, width, face, text, kerning, bold) — 6 args.
-            local measured = RenderText:sizeUtf8Text(
-                0, Screen:getWidth(), face, text, true, bold
-            )
-            local w = measured and measured.x or 0
-            if w * bold_scale <= max_text_w then
-                break
-            end
-            font_sz = font_sz - 1
-        end
+        local key = string.format("%s|%d|%s|%d|%s", face_name, start_sz, tostring(bold), max_text_w, text)
+        local fit = RasterCache.get("badge_font", key, fitFontSize, text, face_name, start_sz, bold, max_text_w)
         return TextWidget:new{
             text    = text,
-            face    = Font:getFace(face_name, font_sz),
+            face    = Font:getFace(face_name, fit.size),
             bold    = bold,
             fgcolor = text_color,
             padding = 0,
@@ -446,7 +402,7 @@ function CoverWidgets.paintCornerRibbon(bb, cover_left, cover_right, cover_top, 
     if span <= 0 or band_thick <= 0 then return end
     local key = string.format("%d|%d|%d|%s|%d|%d|%s|%s", bb:getType(), span, band_thick, label,
         font_sz, dark and 1 or 0, tostring(SUIStyle.BADGE_BORDER_SZ), tostring(SUIStyle.BADGE_BORDER_CLR))
-    local ribbon = cachedRaster("ribbon", key, buildRibbonSprite,
+    local ribbon = RasterCache.get("ribbon", key, buildRibbonSprite,
         bb:getType(), span, band_thick, label, font_sz, dark)
 
     local sprite_x = cover_right - ribbon.w
@@ -749,7 +705,7 @@ end
 -- so blending towards white is what darkens the shadow on screen.
 function CoverWidgets.paintShadow(bb, x, y, w, h, offset)
     if offset <= 0 then return end
-    local masks = cachedRaster("shadow", (w * 4096 + h) * 64 + offset, buildShadowMasks, w, h, offset)
+    local masks = RasterCache.get("shadow", (w * 4096 + h) * 64 + offset, buildShadowMasks, w, h, offset)
     local color = Screen.night_mode and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
     bb:colorblitFromRGB32(masks.right,  x + w,      y + offset, 0, 0, offset, h,      color)
     bb:colorblitFromRGB32(masks.bottom, x + offset, y + h,      0, 0, w,      offset, color)

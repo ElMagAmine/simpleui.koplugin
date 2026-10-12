@@ -2,7 +2,6 @@
 -- Clock module with ordered, show/hide items (clock, date, battery).
 -- Supports "digital", "word" and "analogue" clock styles.
 
-local Blitbuffer      = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local datetime        = require("datetime")
 local Device          = require("device")
@@ -22,6 +21,7 @@ local SUIStyle     = require("features/sui_style")
 local Config       = require("infra/sui_config")
 local SUISettings = require("infra/sui_store")
 local AAPaint      = require("infra/sui_aa_paint")
+local RasterCache  = require("infra/sui_raster_cache")
 local PAD          = UI.PAD
 local CLR_TEXT_SUB = UI.CLR_TEXT_SUB
 
@@ -449,14 +449,11 @@ end
 -- clock" device setting the digital style honours — an analogue dial has no
 -- 24-hour convention to switch to.
 --
--- Composited over the target with UI.paintWithAlphaMask so it sits
--- transparently over a wallpaper, the same way UI.makeColoredText composites
--- coloured text — this drawing routine just fills the role that
--- TextWidget:paintTo plays there.
+-- The face is rasterised into a coverage mask and composited in the clock's
+-- colour, so it sits transparently over a wallpaper.
 
--- Draws the face into `bb` (assumed already white-filled, size diameter ×
--- diameter), in BLACK ink — UI.paintWithAlphaMask inverts and recolours it
--- afterwards.
+-- Draws the face into `bb` (white-filled, size diameter × diameter), in BLACK
+-- ink; AAPaint.buildMask turns the ink into coverage.
 local function _drawAnalogueFace(bb, diameter, hour, min)
     local cx, cy = diameter / 2, diameter / 2
     local r      = diameter / 2
@@ -494,15 +491,20 @@ local function _drawAnalogueFace(bb, diameter, hour, min)
     drawHand(minute_angle, diameter * 0.40, diameter * 0.022)
 end
 
+-- Coverage mask of the whole face, cached per size and 12-hour time. Ticks and
+-- hands overlap, so they are rasterised together rather than as two layers.
+local function _buildFaceMask(diameter, hour12, min)
+    return { bb = AAPaint.buildMask(diameter, diameter, function(bb)
+        _drawAnalogueFace(bb, diameter, hour12, min)
+    end) }
+end
+
 -- Builds a transparent-background widget of size diameter × diameter showing
--- the current time as an analogue face in `fg_color`. Mirrors the structure
--- of UI.makeColoredText (offscreen 8-bit buffer, painted in BLACK, composited
--- via UI.paintWithAlphaMask) — the only difference is the paint routine
--- draws clock-face primitives instead of rendering a TextWidget.
+-- the current time as an analogue face in `fg_color`.
 local function _buildAnalogueClockWidget(diameter, fg_color)
     if diameter < 2 then return nil end
-    local t   = os.date("*t", os.time())
-    local hour, min = t.hour, t.min
+    local t = os.date("*t", os.time())
+    local hour12, min = t.hour % 12, t.min
 
     local widget = WidgetContainer:new{}
     widget.dimen = Geom:new{ w = diameter, h = diameter }
@@ -515,26 +517,9 @@ local function _buildAnalogueClockWidget(diameter, fg_color)
         self.dimen.x, self.dimen.y = x, y
         local d = self.dimen.w
         if d <= 0 then return end
-
-        if not self._tmp_bb or self._tmp_bb:getWidth() ~= d or self._tmp_bb:getHeight() ~= d then
-            if self._tmp_bb then self._tmp_bb:free() end
-            self._tmp_bb = Blitbuffer.new(d, d, Blitbuffer.TYPE_BB8)
-        end
-
-        local custom_paint_fn = function(_widget, tmp_bb)
-            _drawAnalogueFace(tmp_bb, d, hour, min)
-        end
-
-        UI.paintWithAlphaMask(widget, bb, x, y, d, d, fg_color, custom_paint_fn, self._tmp_bb)
-    end
-
-    function widget:onCloseWidget() self:free() end
-
-    function widget:free()
-        if self._tmp_bb then
-            self._tmp_bb:free()
-            self._tmp_bb = nil
-        end
+        local face = RasterCache.get("clock_face", (d * 12 + hour12) * 60 + min,
+            _buildFaceMask, d, hour12, min).bb
+        bb:colorblitFromRGB32(face, x, y, 0, 0, d, d, fg_color)
     end
 
     return widget
