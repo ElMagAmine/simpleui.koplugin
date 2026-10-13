@@ -11,6 +11,7 @@
 local _ = require("infra/sui_i18n").translate
 local Config = require("infra/sui_config")
 local SUISettings = require("infra/sui_store")
+local Backdrop = require("infra/sui_backdrop")
 
 -- Lazy reference to the style module — avoids a circular-require at load time.
 local _SUIStyle
@@ -84,8 +85,6 @@ local SEARCH_ID   = "fm_search"
 M.STYLE_CLASSIC = "classic"
 M.STYLE_TABS    = "tabs"
 
-local _SIZE_SCALE = { compact = 0.75, default = 1.0, large = 1.3 }
-
 local _VIS_DEFAULTS = {
     fm_menu       = true,
     fm_back       = true,
@@ -146,9 +145,20 @@ end
 function M.setStyle(v)   SUISettings:saveSetting(STYLE_KEY, v) end
 function M.isTabsStyle() return M.isEnabled() and M.getStyle() == M.STYLE_TABS end
 
-function M.getSizeKey()   return SUISettings:readSetting(SIZE_KEY) or "default" end
-function M.setSizeKey(v)  SUISettings:saveSetting(SIZE_KEY, v) end
-function M.getSizeScale() return _SIZE_SCALE[M.getSizeKey()] or 1.0 end
+-- Title-bar size in percent, shared by both styles. Sizes saved by the former
+-- named-size setting are converted on first read.
+local SIZE_MAX_PCT    = 150
+local _LEGACY_SIZE_PCT = { compact = 75, default = 100, large = 130 }
+
+M.SIZE_MAX_PCT = SIZE_MAX_PCT
+
+function M.setSizePct(pct) Config.setScaleByKey(pct, SIZE_KEY, SIZE_MAX_PCT) end
+function M.getSizePct()
+    local legacy = _LEGACY_SIZE_PCT[SUISettings:readSetting(SIZE_KEY)]
+    if legacy then M.setSizePct(legacy) end
+    return Config.getScalePctByKey(SIZE_KEY, SIZE_MAX_PCT)
+end
+function M.getSizeScale() return M.getSizePct() / 100 end
 
 -- ---------------------------------------------------------------------------
 -- Config load/save (side assignments + button order)
@@ -364,7 +374,7 @@ local function _installBarScrim(tb)
         local strength = ok and WP.getTitlebarBackdropStrength() or 0
         if strength > 0 then
             local h = (self.dimen and self.dimen.h) or self:getHeight()
-            if h > 0 then WP.paintBackdrop(bb, 0, y, Screen:getWidth(), h, strength) end
+            if h > 0 then Backdrop.paintBackdrop(bb, 0, y, Screen:getWidth(), h, strength) end
         end
         return orig(self, bb, x, y)
     end
@@ -508,18 +518,20 @@ local function _layoutParams(tb)
     }
 end
 
--- Metrics of the compact tabs-style bar. The icon size equals the text height
--- and is also the menu icon size of the classic style.
+-- Metrics of the compact tabs-style bar, scaled by the title-bar size. The
+-- icon size equals the text height and is also the menu icon size of the
+-- classic style.
 local function _tabsMetrics()
-    local S    = SUIStyle()
-    local face = require("ui/font"):getFace(S.FACE_REGULAR, S.FS_BODY)
+    local S     = SUIStyle()
+    local scale = M.getSizeScale()
+    local face  = require("ui/font"):getFace(S.FACE_REGULAR, math.floor(S.FS_BODY * scale))
     local probe = require("ui/widget/textwidget"):new{ text = "A", face = face, padding = 0 }
     local text_h = probe:getSize().h
     probe:free()
     return {
         face      = face,
         iw        = text_h,                        -- icon size == text height
-        pad_v     = Screen:scaleBySize(7),         -- above and below the text row
+        pad_v     = math.floor(Screen:scaleBySize(7) * scale), -- above and below the text row
         margin    = SideM(),                       -- screen edge to icon
         back_gap  = Screen:scaleBySize(14),        -- back icon to the content beside it
         tap_pad_h = Screen:scaleBySize(8),         -- horizontal tap-area padding

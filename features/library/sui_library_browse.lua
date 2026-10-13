@@ -487,9 +487,8 @@ local function _getVirtualList(fc, path, collate)
 
     if level == "dim_list" then
         local values = MetadataSource.getFacetValues(bim, base_dir, active_dimension, filter_state, M.getShowEmpty())
-        local overrides = SUISettings:readSetting("simpleui_fc_covers") or {}
 
-        -- Real (validated) per-group counts and a representative file. A row
+        -- Real (validated) per-group counts and the first books of each group. A row
         -- only counts when its file exists on disk and passes fc:show_file:
         -- the facet counts may include stale bookinfo entries or files the
         -- chooser hides. Groups are matched by entry.key.
@@ -497,10 +496,10 @@ local function _getVirtualList(fc, path, collate)
         -- Only built when collate is truthy: a falsy collate means the caller
         -- only wants a cheap item COUNT (mirrors FileChooser:getList's own
         -- "collate == nil count only" path in KOReader core).
-        local real_counts, real_reprs = {}, {}
+        local real_counts, real_firsts = {}, {}
         if collate then
             local variant, accept = _listingFilter(fc)
-            real_counts, real_reprs = MetadataSource.getValidFacetCounts(
+            real_counts, real_firsts = MetadataSource.getValidFacetCounts(
                 bim, base_dir, active_dimension, filter_state, variant, accept)
         end
 
@@ -511,7 +510,6 @@ local function _getVirtualList(fc, path, collate)
 
             if collate then
                 local real_count = real_counts[entry.key] or 0
-                local real_repr  = real_reprs[entry.key]
 
                 -- Skip virtual folders whose every book has been deleted from
                 -- disk — showing an empty virtual folder would confuse the
@@ -521,24 +519,15 @@ local function _getVirtualList(fc, path, collate)
                     item.nb_sub_files = real_count
                     item.mandatory    = tostring(real_count) .. " \u{F016}"
 
-                    local repr
-                    local override_fp = overrides[vpath]
-                    if override_fp and lfs.attributes(override_fp, "mode") == "file" then
-                        repr = override_fp
-                    elseif real_repr then
-                        repr = real_repr
-                    elseif entry._first then
-                        repr = entry._first[1]
-                    end
-
                     -- Always mark as a virtual meta leaf so the folder
                     -- decoration (stacked-cover lines + badge) is rendered
-                    -- even when no representative cover is available (e.g.
-                    -- the "no author"/"no series" bucket whose books have no
-                    -- cached covers yet).
+                    -- even when no cover is available (e.g. the "no
+                    -- author"/"no series" bucket whose books have no cached
+                    -- covers yet). `cover_paths` are the books its cover is
+                    -- taken from, in order; the list is shared, read-only.
                     item.is_virtual_meta_leaf = true
                     item.virtual_leaf_count   = real_count
-                    if repr then item.representative_filepath = repr end
+                    item.cover_paths          = real_firsts[entry.key]
                     dirs[#dirs + 1] = item
                 end
             else
