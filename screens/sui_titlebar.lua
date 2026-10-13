@@ -822,12 +822,13 @@ local function _installBackController(fm_self, back_icon, shown_x, on_state)
     fc.onFolderUp = function(fc_self, ...)
         local BM = _BrowseMeta()
         if BM then
-            -- Arrived from the book dialog ("More by X"): one back press returns
-            -- to the real folder, scrolled to the book, not to the Authors root.
+            -- Arrived from the book dialog ("More by X"): one back press from
+            -- that author's list returns to the real folder, scrolled to the
+            -- book, not to the Authors root.
             local origin = fc_self._sui_author_dialog_origin
             if origin and origin.path then
                 local ok_pl, level = pcall(BM.getPathLevel, fc_self.path or "")
-                if ok_pl and level == "file_list" then
+                if ok_pl and level == "file_list" and BM.getPathDepth(fc_self.path) == 1 then
                     fc_self._sui_author_dialog_origin = nil
                     BM.exitToNormal(fc_self, fm_self)
                     fc_self:changeToPath(origin.path, origin.file)
