@@ -2597,6 +2597,23 @@ function M.checkpointStatsDB()
     end)
 end
 
+-- Cheap change token for the statistics database: size and mtime of the main
+-- file and its WAL. Returns nil when the database cannot be inspected or was
+-- written within the last two seconds — mtime has one-second resolution, so
+-- an unchanged token that fresh could still hide a later write.
+function M.getStatsDbStamp()
+    if not _ensureSqlite() then return nil end
+    local path = M.getStatsDbPath()
+    local main = _lfs_mod.attributes(path)
+    if not main then return nil end
+    local wal      = _lfs_mod.attributes(path .. "-wal")
+    local newest   = math.max(main.modification, wal and wal.modification or 0)
+    if os.time() - newest < 2 then return nil end
+    return string.format("%d:%d|%d:%d",
+        main.size, main.modification,
+        wal and wal.size or 0, wal and wal.modification or 0)
+end
+
 function M.beginStatsSyncGuard()
     _stats_sync_guard = true
 end
