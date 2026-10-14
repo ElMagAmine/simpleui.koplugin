@@ -10,6 +10,8 @@ local Blitbuffer        = require("ffi/blitbuffer")
 local DataStorage       = require("datastorage")
 local SUISettings       = require("infra/sui_store")
 local SUICoverCache     = require("infra/sui_cover_cache")
+local RasterCache       = require("infra/sui_raster_cache")
+local Backdrop          = require("infra/sui_backdrop")
 local logger            = require("logger")
 local _ = require("infra/sui_i18n").translate
 local T = require("ffi/util").template
@@ -1302,7 +1304,7 @@ function M.makeBackdropStrengthItem(opts)
     local _lc = opts._lc or _
     local function label(strength)
         if opts.format then return opts.format(strength) end
-        return require("features/sui_wallpaper").formatBackdropStrength(strength, _lc)
+        return Backdrop.formatBackdropStrength(strength, _lc)
     end
     return {
         text           = opts.title,
@@ -1318,8 +1320,8 @@ function M.makeBackdropStrengthItem(opts)
                 title_text    = opts.title,
                 info_text     = info .. "\n" .. T(_lc("Default: %1"), label(opts.default_value)),
                 value         = opts.get(),
-                value_min     = 0,
-                value_max     = opts.value_max or 100,
+                value_min     = Backdrop.STRENGTH_MIN,
+                value_max     = opts.value_max or Backdrop.STRENGTH_MAX,
                 value_step    = 5,
                 unit          = "%",
                 ok_text       = _("Apply"),
@@ -1361,7 +1363,7 @@ function M.makeStepperItem(opts)
                 default_value = opts.default_value,
                 callback      = function(spin)
                     opts.set(spin.value)
-                    opts.refresh()
+                    if opts.refresh then opts.refresh() end
                 end,
             })
         end,
@@ -1696,64 +1698,172 @@ function M.makeCoverHoldModeItem(opts)
     }
 end
 
--- Generic N-way radio submenu: a row with a static label and the current
--- choice shown as its right-side value, opening a list of radio choices.
--- Extracted from the get/set/refresh shape already used above by
--- makeCoverHoldModeItem. Any settings-menu consumer with more than an on/off
--- toggle (a style/type/color picker) can reuse this instead of hand-rolling
--- its own sub_item_table_func.
+-- ---------------------------------------------------------------------------
+-- Radio choice lists
+-- ---------------------------------------------------------------------------
+-- A choice list is described once (options + get/set) and rendered either as
+-- a flat list of radio entries (appendRadioItems) or as a submenu row that
+-- shows the current choice on its right side (makeRadioSubmenuItem).
+--
+-- Option fields:
+--   value               any        stored value the option represents
+--   label               string     entry text
+--   help_text           string?    long-press help for the entry
+--   enabled_func        function?  disables the entry
+--   separator           bool?      separator below the entry
+--   selected            function?  (current) -> bool; replaces the default
+--                                  `current == value` check, for options that
+--                                  stand for a group of values
+--   sub_item_table_func function?  opens a nested list instead of storing
+--                                  `value`; the entry stays a radio, checked
+--                                  while the option is selected
+
+-- Static option list, or one built lazily by a function.
+local function _resolveOptions(options)
+    if type(options) == "function" then return options() end
+    return options
+end
+
+local function _isSelected(option, current)
+    if option.selected then return option.selected(current) end
+    return option.value == current
+end
+
+-- Appends one radio entry per option to `items` and returns `items`.
+-- opts:
+--   options     table|function  option list, or a function building it when
+--                               the entries are needed (required)
+--   get         function()      current value (required)
+--   set         function(value) (required)
+--   refresh     function?       called after set()
+--   empty_text  string?         disabled entry shown when there are no options
+function M.appendRadioItems(items, opts)
+    local get, set, refresh = opts.get, opts.set, opts.refresh
+    local options = _resolveOptions(opts.options)
+    if #options == 0 and opts.empty_text then
+        items[#items + 1] = { text = opts.empty_text, enabled = false }
+        return items
+    end
+    for _i, option in ipairs(options) do
+        local item = {
+            text         = option.label,
+            help_text    = option.help_text,
+            enabled_func = option.enabled_func,
+            separator    = option.separator,
+            radio        = true,
+            checked_func = function() return _isSelected(option, get()) end,
+        }
+        if option.sub_item_table_func then
+            item.sub_item_table_func = option.sub_item_table_func
+        else
+            item.keep_menu_open = true
+            item.callback = function()
+                set(option.value)
+                if refresh then refresh() end
+            end
+        end
+        items[#items + 1] = item
+    end
+    return items
+end
+
+-- A row with a static label and the current choice shown as its right-side
+-- value, opening the radio list. Any settings-menu consumer with more than an
+-- on/off toggle (a style/type/color picker) can reuse this instead of
+-- hand-rolling its own sub_item_table_func.
 --
 -- The label never embeds the current choice (no "Type: X"); the choice is
 -- exposed only through value_func / mandatory_func.
 --
--- opts:
+-- opts: the appendRadioItems fields, plus
 --   text          string    static row label (ignored if text_func given)
 --   text_func     function? () -> string, overrides `text`
 --   help_text     string?   long-press help for the row
---   options       { { value = any, label = string }, ... }  (required,
---                 ordered — this order is also the menu order)
---   get           function() -> current value (required)
---   set           function(value)  (required)
---   refresh       function?  called after set()
---   enabled_func  function?  disables the whole row (e.g. "Color" greyed out
---                 while the parent "Type" is "None")
+--   current_label function? () -> string, the text shown for the current
+--                           choice. Required when `options` is a function or
+--                           a nested option stands for several values, so the
+--                           option list is not rebuilt on every render.
+--   enabled_func  function? disables the whole row (e.g. "Color" greyed out
+--                           while the parent "Type" is "None")
 --   separator     bool?
--- Both the row's value_func and mandatory_func show the current option's
--- label, matching the convention already used for "Long Press" above and
--- for Sort/native KOReader radio rows in general.
+-- Both value_func and mandatory_func show the current choice, matching the
+-- convention used for "Long Press" above and for native radio rows.
 function M.makeRadioSubmenuItem(opts)
-    local get     = opts.get
-    local set     = opts.set
-    local refresh = opts.refresh
-    local function _labelFor(v)
-        for _, o in ipairs(opts.options) do
-            if o.value == v then return o.label end
+    local get = opts.get
+    local function currentLabel()
+        if opts.current_label then return opts.current_label() or "" end
+        local current = get()
+        for _i, option in ipairs(_resolveOptions(opts.options)) do
+            if _isSelected(option, current) then return option.label end
         end
         return ""
     end
     return {
         text_func      = opts.text_func or function() return opts.text end,
-        value_func     = function() return _labelFor(get()) end,
-        mandatory_func = function() return _labelFor(get()) end,
+        value_func     = currentLabel,
+        mandatory_func = currentLabel,
         help_text      = opts.help_text,
         enabled_func   = opts.enabled_func,
         separator      = opts.separator,
-        sub_item_table_func = function()
-            local items = {}
-            for _, o in ipairs(opts.options) do
-                items[#items + 1] = {
-                    text           = o.label,
-                    radio          = true,
-                    checked_func   = function() return get() == o.value end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        set(o.value)
-                        if refresh then refresh() end
-                    end,
-                }
-            end
-            return items
-        end,
+        sub_item_table_func = function() return M.appendRadioItems({}, opts) end,
+    }
+end
+
+-- Returns `stored` when it is one of `values`, otherwise `default`.
+-- Guards against unset or corrupted persisted enum values.
+function M.resolveChoice(stored, values, default)
+    for _i, allowed in ipairs(values) do
+        if allowed == stored then return stored end
+    end
+    return default
+end
+
+-- Reads the persisted enum under `key` and validates it with resolveChoice.
+function M.readChoice(key, values, default)
+    return M.resolveChoice(SUISettings:readSetting(key), values, default)
+end
+
+-- Horizontal alignment ids; the default set is left / center / right.
+local ALIGN_VALUES  = { "left", "center", "right" }
+local ALIGN_DEFAULT = "center"
+
+-- Persisted alignment under `key`. `values` and `default` fall back to
+-- left / center / right and "center".
+function M.getAlignment(key, values, default)
+    return M.readChoice(key, values or ALIGN_VALUES, default or ALIGN_DEFAULT)
+end
+
+-- Alignment picker row built on makeRadioSubmenuItem.
+-- opts:
+--   key           string    full settings key (required)
+--   values        string[]? ordered ids among left, center, right, justify
+--                           (default: left, center, right)
+--   default       string?   id used while nothing valid is stored (default: center)
+--   text          string?   row label (default: "Alignment")
+--   enabled_func  function? disables the row
+--   separator     bool?
+--   refresh       function? called after a change
+--   _lc           function? translator
+function M.makeAlignmentItem(opts)
+    local _lc = opts._lc or _
+    local labels = {
+        left    = _lc("Left"),
+        center  = _lc("Center"),
+        right   = _lc("Right"),
+        justify = _lc("Justified"),
+    }
+    local options = {}
+    for _i, id in ipairs(opts.values or ALIGN_VALUES) do
+        options[#options + 1] = { value = id, label = labels[id] }
+    end
+    return M.makeRadioSubmenuItem{
+        text         = opts.text or _lc("Alignment"),
+        enabled_func = opts.enabled_func,
+        separator    = opts.separator,
+        options      = options,
+        get          = function() return M.getAlignment(opts.key, opts.values, opts.default) end,
+        set          = function(v) SUISettings:saveSetting(opts.key, v) end,
+        refresh      = opts.refresh,
     }
 end
 
@@ -1770,6 +1880,29 @@ function M.makeLabelToggleItem(mod_id, refresh, _lc)
     }
 end
 
+-- Turns an Arrange-screen item into a show/hide row. The eye icon reflects
+-- the current state and flips it in place; a hidden row is dimmed and keeps
+-- its position in the list.
+--   opts.is_visible   function() -> bool
+--   opts.set_visible  function(visible) -> false|nil   (false vetoes the change)
+--   opts.on_change    function|nil   runs after an accepted change
+--   opts.repaint      function       redraws the Arrange screen
+function M.applyVisibilityToggle(item, opts)
+    local function sync()
+        local visible = opts.is_visible()
+        item.dim_row     = not visible or nil
+        item.toggle_icon = visible and "show" or "hide"
+    end
+    item.on_toggle = function()
+        if opts.set_visible(not opts.is_visible()) == false then return end
+        sync()
+        if opts.on_change then opts.on_change() end
+        opts.repaint()
+    end
+    sync()
+    return item
+end
+
 -- ===========================================================================
 -- 6. Cover Management & Caching
 -- ===========================================================================
@@ -1780,20 +1913,43 @@ M._cover_extract_pending = {}
 M._cover_extract_specs   = {}
 
 local _BookInfoManager = nil
+local _bbBytes = RasterCache.bbBytes
 
--- Makes the book info store drop this module's cached cover state for a book
--- whenever it forgets that book (cover or metadata changes, manual refresh).
--- Wrapped from the store's original method, so repeated calls never stack.
-local function _hookBookInfoDeletion(bim)
-    local orig = bim._sui_orig_deleteBookInfo or bim.deleteBookInfo
-    if type(orig) ~= "function" then return bim end
-    bim._sui_orig_deleteBookInfo = orig
-    bim.deleteBookInfo = function(self, filepath)
-        if filepath then M.dropCoverCaches(filepath) end
-        return orig(self, filepath)
+-- Listeners told when a book's record in the book info store changes:
+-- fn(filepath, method). Records written by background extraction happen in a
+-- separate process and are not reported.
+local _bookinfo_listeners = {}
+
+function M.onBookInfoChanged(fn)
+    _bookinfo_listeners[#_bookinfo_listeners + 1] = fn
+end
+
+local _BOOKINFO_MUTATORS = { "deleteBookInfo", "setBookInfoProperties", "extractBookInfo" }
+
+-- Wraps the store's methods that change a book's record so that listeners
+-- hear about it before the change is applied. Wrapped from the original
+-- methods, so repeated calls never stack.
+local function _hookBookInfoChanges(bim)
+    for _, name in ipairs(_BOOKINFO_MUTATORS) do
+        local orig = bim["_sui_orig_" .. name] or bim[name]
+        if type(orig) == "function" then
+            bim["_sui_orig_" .. name] = orig
+            bim[name] = function(self, filepath, ...)
+                if filepath then
+                    for _, fn in ipairs(_bookinfo_listeners) do fn(filepath, name) end
+                end
+                return orig(self, filepath, ...)
+            end
+        end
     end
     return bim
 end
+
+-- The store forgetting a book (cover or metadata changes, manual refresh)
+-- invalidates the cover state cached here.
+M.onBookInfoChanged(function(filepath, method)
+    if method == "deleteBookInfo" then M.dropCoverCaches(filepath) end
+end)
 
 function M.getBookInfoManager()
     if _BookInfoManager then return _BookInfoManager end
@@ -1802,7 +1958,7 @@ function M.getBookInfoManager()
         ok, bim = pcall(require, "plugins/coverbrowser.koplugin/bookinfomanager")
     end
     if ok and bim and type(bim) == "table" and bim.getBookInfo then
-        _BookInfoManager = _hookBookInfoDeletion(bim)
+        _BookInfoManager = _hookBookInfoChanges(bim)
         return _BookInfoManager
     end
     return nil
@@ -1831,23 +1987,6 @@ local function _lfsMode(fp)
         _lfs_cover = l
     end
     return _lfs_cover.attributes(fp, "mode")
-end
-
--- Resident byte size of a cached cover bb. stride * height is the true RAM
--- footprint of the underlying C allocation (including row padding), and it
--- scales correctly with bit depth (1 B/px grayscale e-ink vs 4 B/px RGB32)
--- without this cache needing to know the device/panel type.
-local function _bbBytes(bb)
-    if not bb then return 0 end
-    local ok, n = pcall(function()
-        local h = (bb.getHeight and bb:getHeight()) or tonumber(bb.h) or 0
-        local stride = tonumber(bb.stride)
-        if stride and h > 0 then return stride * h end
-        local w   = (bb.getWidth and bb:getWidth()) or 0
-        local bpp = (bb.getBpp and bb:getBpp()) or 8
-        return w * h * math.ceil(bpp / 8)
-    end)
-    return (ok and n) or 0
 end
 
 -- isCoverMissing(filepath) is queried from both cover APIs below on every
@@ -2113,10 +2252,66 @@ local function _coverTooSmall(bim, bookinfo, w, h)
     }) and true or false
 end
 
--- Drop stretch + ref entries so a later put after re-extract can install the
+-- Cropped slot cache: the result of cropping a book's reference cover to one
+-- slot shape (width, height, alignment). Slots are small, so a few MiB hold
+-- every visible peek and Quad quadrant. Entries are shared with live
+-- ImageWidgets (image_disposable = false), so evicting only drops the
+-- reference and never frees the buffer.
+local _CROP_BYTE_BUDGET = 4 * 1024 * 1024
+local _crop_cache = {}   -- filepath -> { [slot_key] = { bb, bytes, tick } }
+local _crop_bytes = 0
+local _crop_tick  = 0
+
+local function _cropSlotKey(w, h, align)
+    return w .. "x" .. h .. (align or "")
+end
+
+local function _cropGet(filepath, slot_key)
+    local entry = _crop_cache[filepath] and _crop_cache[filepath][slot_key]
+    if not entry then return nil end
+    _crop_tick = _crop_tick + 1
+    entry.tick = _crop_tick
+    return entry.bb
+end
+
+local function _cropEvictOverBudget(keep)
+    while _crop_bytes > _CROP_BYTE_BUDGET do
+        local oldest, oldest_fp, oldest_key
+        for fp, slots in pairs(_crop_cache) do
+            for key, entry in pairs(slots) do
+                if entry ~= keep and (not oldest or entry.tick < oldest.tick) then
+                    oldest, oldest_fp, oldest_key = entry, fp, key
+                end
+            end
+        end
+        if not oldest then return end
+        _crop_bytes = _crop_bytes - oldest.bytes
+        _crop_cache[oldest_fp][oldest_key] = nil
+        if next(_crop_cache[oldest_fp]) == nil then _crop_cache[oldest_fp] = nil end
+    end
+end
+
+local function _cropPut(filepath, slot_key, bb)
+    _crop_tick = _crop_tick + 1
+    local entry = { bb = bb, bytes = _bbBytes(bb), tick = _crop_tick }
+    _crop_cache[filepath] = _crop_cache[filepath] or {}
+    _crop_cache[filepath][slot_key] = entry
+    _crop_bytes = _crop_bytes + entry.bytes
+    _cropEvictOverBudget(entry)
+end
+
+local function _cropDrop(filepath)
+    local slots = _crop_cache[filepath]
+    if not slots then return end
+    for _, entry in pairs(slots) do _crop_bytes = _crop_bytes - entry.bytes end
+    _crop_cache[filepath] = nil
+end
+
+-- Drop stretch, crop and ref entries so a later put after re-extract can install the
 -- higher-quality bb (prefer-larger alone keeps same pixel-count upscales).
 local function _dropLocalCoverCaches(filepath)
     SUICoverCache:drop(filepath)
+    _cropDrop(filepath)
     local entry = _bim_ref_cache[filepath]
     if not entry then return end
     _removeRefOrderKey(filepath)
@@ -2161,6 +2356,12 @@ local function _stretchBBToSize(raw_bb, target_w, target_h)
     if stretched_bb ~= cp_bb then pcall(cp_bb.free, cp_bb) end
     return stretched_bb
 end
+
+-- Stretches `bb` to exactly w x h, aspect not preserved, for consumers that
+-- reshape a cover themselves. Returns a new buffer owned by the caller, or
+-- `bb` itself when it could not be scaled; callers free the result only when
+-- it differs from `bb`.
+M.stretchBBToSize = _stretchBBToSize
 
 -- Decodes the cover bitmap held by the book info store. The decode is
 -- comparatively expensive, so callers first validate through metadata-only
@@ -2245,14 +2446,22 @@ function M.getCroppedCoverBB(filepath, w, h, align)
     end
 
     M._cover_extract_pending[filepath] = nil
-    -- Shared uncropped ref; crop fresh so callers can differ on align.
+    local slot_key = _cropSlotKey(w, h, align)
+    local cropped = _cropGet(filepath, slot_key)
+    if cropped then return cropped end
+
+    -- Shared uncropped ref; each slot shape is cropped from it once.
     local ref_bb = _cachedRefCoverBB(filepath)
     if not ref_bb then
         local raw_bb = _loadCoverBB(bim, filepath)
         if not raw_bb then return _noCover(filepath) end
         ref_bb = _getRefCoverBB(filepath, raw_bb)
     end
-    return _scaleBBToSlot(ref_bb, w, h, align)
+    cropped = _scaleBBToSlot(ref_bb, w, h, align)
+    -- _scaleBBToSlot hands back its source when it cannot scale; that buffer
+    -- belongs to the reference cache and must not be cached here.
+    if cropped and cropped ~= ref_bb then _cropPut(filepath, slot_key, cropped) end
+    return cropped
 end
 
 function M.clearCoverCache()
@@ -2260,6 +2469,7 @@ function M.clearCoverCache()
     -- clear()'s own contract is already "drop references, don't free()"
     -- (see that module), so no deferred-sweep coordination is needed here.
     SUICoverCache:clear()
+    _crop_cache, _crop_bytes = {}, 0
 
     -- No-cover probes hold no bb payload (just filepath markers) — nothing
     -- to free, reset synchronously.
@@ -2385,6 +2595,23 @@ function M.checkpointStatsDB()
         conn:exec("PRAGMA wal_checkpoint(TRUNCATE);")
         conn:close()
     end)
+end
+
+-- Cheap change token for the statistics database: size and mtime of the main
+-- file and its WAL. Returns nil when the database cannot be inspected or was
+-- written within the last two seconds — mtime has one-second resolution, so
+-- an unchanged token that fresh could still hide a later write.
+function M.getStatsDbStamp()
+    if not _ensureSqlite() then return nil end
+    local path = M.getStatsDbPath()
+    local main = _lfs_mod.attributes(path)
+    if not main then return nil end
+    local wal      = _lfs_mod.attributes(path .. "-wal")
+    local newest   = math.max(main.modification, wal and wal.modification or 0)
+    if os.time() - newest < 2 then return nil end
+    return string.format("%d:%d|%d:%d",
+        main.size, main.modification,
+        wal and wal.size or 0, wal and wal.modification or 0)
 end
 
 function M.beginStatsSyncGuard()
@@ -2691,6 +2918,7 @@ function M.applyFirstRunDefaults()
     def("simpleui_fc_cover_mode",       "2_3")
     def("simpleui_fc_subfolder_cover",  true)
     def("simpleui_browsemeta_enabled",  true)
+    def("simpleui_browsemeta_show_empty", false)
 
     -- Titlebar: search visible, browse visible left of menu
     def("simpleui_tb_item_fm_search", true)

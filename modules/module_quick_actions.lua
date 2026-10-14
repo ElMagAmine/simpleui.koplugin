@@ -20,6 +20,7 @@ local QARenderer      = require("engines/sui_quickactions_render")
 
 local UI  = require("infra/sui_core")
 local SUISettings = require("infra/sui_store")
+local Backdrop    = require("infra/sui_backdrop")
 local SUIStyle    = require("features/sui_style")
 local PAD = UI.PAD
 local LABEL_H = UI.LABEL_H
@@ -264,8 +265,7 @@ local function makeInstance(inst_id)
     end
 
     local function getBtnStrength(pfx)
-        local WP = require("features/sui_wallpaper")
-        local v = WP.readBackdropStrength(pfx .. STRENGTH_KEY)
+        local v = Backdrop.readBackdropStrength(pfx .. STRENGTH_KEY)
         if v ~= nil then return v end
         if SUISettings:readSetting(pfx .. BG_KEY) == "transparent" then
             return 0
@@ -274,16 +274,15 @@ local function makeInstance(inst_id)
     end
 
     local function setBtnStrength(pfx, n)
-        require("features/sui_wallpaper").saveBackdropStrength(pfx .. STRENGTH_KEY, n)
+        Backdrop.saveBackdropStrength(pfx .. STRENGTH_KEY, n)
     end
 
     -- "current" (default) = existing behaviour, icons spread across the full
     -- module width. "left"/"right" pack them (same sizes, fixed gap —
     -- see buildQAWidget) against one edge instead.
+    local ALIGN_VALUES = { "current", "left", "right" }
     local function getAlign(pfx)
-        local v = SUISettings:readSetting(pfx .. ALIGN_KEY)
-        if v == "left" or v == "right" then return v end
-        return "current"
+        return Config.readChoice(pfx .. ALIGN_KEY, ALIGN_VALUES, "current")
     end
 
     local S = {}
@@ -608,66 +607,27 @@ local function makeInstance(inst_id)
             appearance_extra[#appearance_extra + 1] = hide_text_node
         end
 
-        appearance_extra[#appearance_extra + 1] = {
-            text = _lc("Button Type"),
-            sub_item_table = {
-                {
-                    text           = _lc("Round"),
-                    radio          = true,
-                    checked_func   = function() return getShape(pfx) == "round" end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. SHAPE_KEY, "round")
-                        refresh()
-                    end,
-                },
-                {
-                    text           = _lc("Rounded Square"),
-                    radio          = true,
-                    checked_func   = function() return getShape(pfx) == "rounded_square" end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. SHAPE_KEY, "rounded_square")
-                        refresh()
-                    end,
-                },
-                {
-                    text           = _lc("Bare"),
-                    radio          = true,
-                    checked_func   = function() return getShape(pfx) == "bare" end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. SHAPE_KEY, "bare")
-                        refresh()
-                    end,
-                },
+        appearance_extra[#appearance_extra + 1] = Config.makeRadioSubmenuItem{
+            text    = _lc("Button Type"),
+            options = {
+                { value = "round",          label = _lc("Round") },
+                { value = "rounded_square", label = _lc("Rounded Square") },
+                { value = "bare",           label = _lc("Bare") },
             },
+            get     = function() return getShape(pfx) end,
+            set     = function(v) SUISettings:saveSetting(pfx .. SHAPE_KEY, v) end,
+            refresh = refresh,
         }
-        appearance_extra[#appearance_extra + 1] = {
-            text = _lc("Button Style"),
+        appearance_extra[#appearance_extra + 1] = Config.makeRadioSubmenuItem{
+            text         = _lc("Button Style"),
             enabled_func = function() return getShape(pfx) ~= "bare" end,
-            sub_item_table = {
-                {
-                    text           = _lc("Solid"),
-                    radio          = true,
-                    checked_func   = function() return getBg(pfx) == "solid" end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. BG_KEY, "solid")
-                        refresh()
-                    end,
-                },
-                {
-                    text           = _lc("Flat"),
-                    radio          = true,
-                    checked_func   = function() return getBg(pfx) == "flat" end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. BG_KEY, "flat")
-                        refresh()
-                    end,
-                },
+            options      = {
+                { value = "solid", label = _lc("Solid") },
+                { value = "flat",  label = _lc("Flat") },
             },
+            get          = function() return getBg(pfx) end,
+            set          = function(v) SUISettings:saveSetting(pfx .. BG_KEY, v) end,
+            refresh      = refresh,
         }
         appearance_extra[#appearance_extra + 1] = Config.makeBackdropStrengthItem({
             title         = _lc("Button Opacity"),
@@ -678,40 +638,16 @@ local function makeInstance(inst_id)
             default_value = 100,
             _lc           = _lc,
         })
-        appearance_extra[#appearance_extra + 1] = {
-            text = _lc("Alignment"),
-            sub_item_table = {
-                {
-                    text           = _lc("Justified"),
-                    radio          = true,
-                    checked_func   = function() return getAlign(pfx) == "current" end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. ALIGN_KEY, "current")
-                        refresh()
-                    end,
-                },
-                {
-                    text           = _lc("Left"),
-                    radio          = true,
-                    checked_func   = function() return getAlign(pfx) == "left" end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. ALIGN_KEY, "left")
-                        refresh()
-                    end,
-                },
-                {
-                    text           = _lc("Right"),
-                    radio          = true,
-                    checked_func   = function() return getAlign(pfx) == "right" end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. ALIGN_KEY, "right")
-                        refresh()
-                    end,
-                },
+        appearance_extra[#appearance_extra + 1] = Config.makeRadioSubmenuItem{
+            text    = _lc("Alignment"),
+            options = {
+                { value = "current", label = _lc("Justified") },
+                { value = "left",    label = _lc("Left") },
+                { value = "right",   label = _lc("Right") },
             },
+            get     = function() return getAlign(pfx) end,
+            set     = function(v) SUISettings:saveSetting(pfx .. ALIGN_KEY, v) end,
+            refresh = refresh,
         }
 
         return Config.buildModuleMenu({

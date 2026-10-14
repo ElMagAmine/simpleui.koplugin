@@ -16,7 +16,6 @@ local OverlapGroup    = require("ui/widget/overlapgroup")
 local TextWidget      = require("ui/widget/textwidget")
 local UIManager       = require("ui/uimanager")
 local VerticalGroup   = require("ui/widget/verticalgroup")
-local Widget          = require("ui/widget/widget")
 local Screen          = Device.screen
 local _ = require("infra/sui_i18n").translate
 local N_ = require("infra/sui_i18n").ngettext
@@ -24,8 +23,8 @@ local Config          = require("infra/sui_config")
 
 local UI      = require("infra/sui_core")
 local SUISettings = require("infra/sui_store")
+local Backdrop    = require("infra/sui_backdrop")
 local SUIStyle    = require("features/sui_style")
-local StreakFreeze = require("infra/sui_streak")
 local CLR_TEXT_SUB = UI.CLR_TEXT_SUB
 local PAD     = UI.PAD
 local MOD_GAP = UI.MOD_GAP
@@ -81,14 +80,11 @@ local function getType(pfx)
 end
 
 local function getAlign(pfx)
-    local v = SUISettings:readSetting(pfx .. SETTING_ALIGN)
-    if v == "left" or v == "right" or v == "center" then return v end
-    return "center"
+    return Config.getAlignment(pfx .. SETTING_ALIGN)
 end
 
 local function getCardStrength(pfx)
-    local WP = require("features/sui_wallpaper")
-    local v = WP.readBackdropStrength(pfx .. SETTING_CARD_STR)
+    local v = Backdrop.readBackdropStrength(pfx .. SETTING_CARD_STR)
     if v ~= nil then return v end
     -- Migrate legacy transparent style.
     if SUISettings:readSetting(pfx .. SETTING_TYPE) == "cards_transparent" then
@@ -98,19 +94,13 @@ local function getCardStrength(pfx)
 end
 
 local function setCardStrength(pfx, n)
-    require("features/sui_wallpaper").saveBackdropStrength(pfx .. SETTING_CARD_STR, n)
+    Backdrop.saveBackdropStrength(pfx .. SETTING_CARD_STR, n)
 end
 
 local function _getItems(pfx)
     local saved = SUISettings:readSetting((pfx or "simpleui_hs_") .. "reading_stats_items")
     if type(saved) ~= "table" or #saved == 0 then return { "total_books", "today_time", "streak" } end
     return saved
-end
-
-local function alignLabel(align)
-    if align == "left"  then return _("Left")  end
-    if align == "right" then return _("Right") end
-    return _("Center")
 end
 
 -- ---------------------------------------------------------------------------
@@ -250,37 +240,6 @@ local function _buildCardInner(stat_id, stats, d, align, clr_blk, clr_sub, max_w
     }
 end
 
--- Fill layer for stat cards: strength 0–100 via shared backdrop painter.
--- Fill + optional border in a single widget, both driven by the shared
--- wallpaper backdrop painter so their rounded corners always match exactly
--- (mixing this fill with a native FrameContainer border, which rounds
--- corners with a different algorithm, leaves a sliver of wallpaper showing
--- through at the corners).
-local CardFill = Widget:extend{
-    width = 0,
-    height = 0,
-    strength = 100,
-    radius = 0,
-    color = nil,
-    show_frame = false,
-}
-
-function CardFill:getSize()
-    return Geom:new{ w = self.width, h = self.height }
-end
-
-function CardFill:paintTo(bb, x, y)
-    if self.width <= 0 or self.height <= 0 then return end
-    local ok, WP = pcall(require, "features/sui_wallpaper")
-    if not (ok and WP) then return end
-    if self.strength > 0 and WP.paintBackdrop then
-        WP.paintBackdrop(bb, x, y, self.width, self.height, self.strength, self.radius, self.color)
-    end
-    if self.show_frame and WP.paintFrame then
-        WP.paintFrame(bb, x, y, self.width, self.height, SUIStyle.BORDER_SZ, self.radius, SUIStyle.COLOR.gray)
-    end
-end
-
 -- Cards mode: optional border + strength-based fill.
 -- Flat mode: no border, surface_flat fill at the same strength.
 -- `d` is the scaled-dims table produced once per M.build() call.
@@ -299,13 +258,13 @@ local function buildStatCardWidget(card_w, stat_id, stats, d, align, colors, str
         padding    = 0,
         cc,
     }
-    local fill = CardFill:new{
+    local fill = Backdrop.BackdropFill:new{
         width = card_w,
         height = d.card_h,
         strength = strength or 100,
         radius = d.corner_r,
         color = fill_color,
-        show_frame = not flat,
+        border_sz = flat and 0 or SUIStyle.BORDER_SZ,
         dimen = Geom:new{ w = card_w, h = d.card_h },
     }
     local card = OverlapGroup:new{
@@ -355,45 +314,29 @@ local function buildStatListCell(cell_w, stat_id, stats, show_sep, d, align, col
     return og, update_fn
 end
 
+--- Opens a statistics window by id. Returns false when the windows module
+--- is unavailable so the caller can fall back.
+local function _openStatsWindow(id)
+    return (pcall(require("screens/sui_stats_launcher").open, id))
+end
+
 local function openReadingInsights()
-    local ok, SW = pcall(require, "screens/sui_stats_windows")
-    if ok and SW and SW.showReadingInsightsWindow then
-        if SW.showLoadingNotice then SW.showLoadingNotice() end
-        SW.showReadingInsightsWindow()
-    else
-        -- Fallback: open the built-in stats plugin if sui_stats_windows is unavailable.
+    if not _openStatsWindow("insights") then
         UIManager:broadcastEvent(require("ui/event"):new("ShowReaderProgress"))
     end
 end
 
---- Opens the Streak Manager window (streak card tap). Returns true on
---- success so the caller can fall back to openReadingInsights() when
---- sui_stats_windows is unavailable.
-local function openStreakManager()
-    local ok, SW = pcall(require, "screens/sui_stats_windows")
-    if ok and SW and SW.showStreakManagerWindow then
-        if SW.showLoadingNotice then SW.showLoadingNotice() end
-        SW.showStreakManagerWindow()
-        return true
-    end
-    return false
-end
-
---- Opens the detail screen for a tapped stat card, if it has one
---- (total_books -> finished-books dialog, streak -> Streak Manager).
+--- Opens the detail window of a tapped stat card, if it has one
+--- (total_books -> finished books, streak -> Streak Manager).
 --- Shared by both tap handlers in M.build() below. Returns true if a
---- detail screen was opened.
+--- detail window was opened.
 local function _openStatDetail(stat_ids, idx, n)
     if idx < 1 or idx > n then return false end
     local sid = stat_ids[idx]
     if sid == "total_books" then
-        local ok, SW = pcall(require, "screens/sui_stats_windows")
-        if ok and SW and SW.showFinishedBooksDialog then
-            SW.showFinishedBooksDialog()
-            return true
-        end
+        return _openStatsWindow("finished_books")
     elseif sid == "streak" then
-        return openStreakManager()
+        return _openStatsWindow("streak")
     end
     return false
 end
@@ -856,40 +799,16 @@ function M.getMenuItems(ctx_menu)
             refresh     = refresh,
             _lc         = _lc,
         }),
-        {
-            text           = _lc("Style"),
-            sub_item_table = {
-                {
-                    text           = _lc("Cards"),
-                    radio          = true,
-                    keep_menu_open = true,
-                    checked_func   = function() return getType(pfx) == "cards" end,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. SETTING_TYPE, "cards")
-                        refresh()
-                    end,
-                },
-                {
-                    text           = _lc("Flat"),
-                    radio          = true,
-                    keep_menu_open = true,
-                    checked_func   = function() return getType(pfx) == "flat" end,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. SETTING_TYPE, "flat")
-                        refresh()
-                    end,
-                },
-                {
-                    text           = _lc("List"),
-                    radio          = true,
-                    keep_menu_open = true,
-                    checked_func   = function() return getType(pfx) == "list" end,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. SETTING_TYPE, "list")
-                        refresh()
-                    end,
-                },
+        Config.makeRadioSubmenuItem{
+            text    = _lc("Style"),
+            options = {
+                { value = "cards", label = _lc("Cards") },
+                { value = "flat",  label = _lc("Flat") },
+                { value = "list",  label = _lc("List") },
             },
+            get     = function() return getType(pfx) end,
+            set     = function(v) SUISettings:saveSetting(pfx .. SETTING_TYPE, v) end,
+            refresh = refresh,
         },
         Config.makeBackdropStrengthItem({
             title         = _lc("Card Opacity"),
@@ -900,41 +819,10 @@ function M.getMenuItems(ctx_menu)
             default_value = 100,
             _lc           = _lc,
         }),
-        {
-            text_func  = function() return _lc("Alignment") end,
-            value_func = function() return alignLabel(getAlign(pfx)) end,
-            sub_item_table = {
-                {
-                    text           = _lc("Left"),
-                    radio          = true,
-                    keep_menu_open = true,
-                    checked_func   = function() return getAlign(pfx) == "left"   end,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. SETTING_ALIGN, "left")
-                        refresh()
-                    end,
-                },
-                {
-                    text           = _lc("Center"),
-                    radio          = true,
-                    keep_menu_open = true,
-                    checked_func   = function() return getAlign(pfx) == "center" end,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. SETTING_ALIGN, "center")
-                        refresh()
-                    end,
-                },
-                {
-                    text           = _lc("Right"),
-                    radio          = true,
-                    keep_menu_open = true,
-                    checked_func   = function() return getAlign(pfx) == "right"  end,
-                    callback       = function()
-                        SUISettings:saveSetting(pfx .. SETTING_ALIGN, "right")
-                        refresh()
-                    end,
-                },
-            },
+        Config.makeAlignmentItem{
+            key     = pfx .. SETTING_ALIGN,
+            refresh = refresh,
+            _lc     = _lc,
         },
     }
 
@@ -954,58 +842,14 @@ function M.getMenuItems(ctx_menu)
         }
     end
 
-    items[#items+1] = {
-        text_func      = function() return _lc("Streak Mode") end,
-        value_func     = function()
-            return StreakFreeze.isFreezeModeEnabled()
-                and _lc("Freezes")
-                or  _lc("Real streak only")
-        end,
-        sub_item_table = {
-            {
-                text           = _lc("Freezes"),
-                radio          = true,
-                keep_menu_open = true,
-                checked_func   = function() return StreakFreeze.getStreakMode() == "freezes" end,
-                callback       = function()
-                    StreakFreeze.setStreakMode("freezes")
-                    refresh()
-                end,
-            },
-            {
-                text           = _lc("Real streak only"),
-                radio          = true,
-                keep_menu_open = true,
-                checked_func   = function() return StreakFreeze.getStreakMode() == "real" end,
-                callback       = function()
-                    StreakFreeze.setStreakMode("real")
-                    refresh()
-                end,
-            },
-        },
-    }
-
+    -- Shortcuts: both live in the global Stats settings.
+    local StatsMenu = require("features/sui_stats_menu")
+    items[#items+1] = StatsMenu.makeStreakModeItem(refresh)
     items[#items+1] = {
         text           = _lc("Update Stats Now"),
         separator      = true,
         keep_menu_open = true,
-        callback       = function()
-            local SP = package.loaded["modules/module_stats_provider"]
-            if SP and SP.invalidate then SP.invalidate() end
-            local SH = package.loaded["modules/module_books_shared"]
-            if SH and SH.invalidateSidecarCache then SH.invalidateSidecarCache() end
-            local MC = package.loaded["modules/module_currently"]
-            if MC and MC.invalidateCache then MC.invalidateCache() end
-            local MCD = package.loaded["modules/module_coverdeck"]
-            if MCD and MCD.invalidateCache then MCD.invalidateCache() end
-            
-            local ScreenEngine = package.loaded["engines/sui_screen_engine"]
-            if ScreenEngine and ScreenEngine.invalidateAllCfgAndRefresh then
-                ScreenEngine.invalidateAllCfgAndRefresh(true)
-            end
-            if ctx_menu and type(ctx_menu.refresh) == "function" then ctx_menu.refresh() elseif refresh then refresh() end
-            UI.Notify.toast(_lc("Stats updated successfully."), 2)
-        end,
+        callback       = function() StatsMenu.updateNow(ctx_menu.refresh or refresh) end,
     }
 
     local item_rows, size_rows, appearance_extra, content_rows, behaviour_rows = {}, {}, {}, {}, {}

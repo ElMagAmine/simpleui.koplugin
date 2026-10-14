@@ -21,21 +21,20 @@
 -- used elsewhere in Simple UI's own stats screens.
 
 local Blitbuffer      = require("ffi/blitbuffer")
-local CenterContainer = require("ui/widget/container/centercontainer")
 local Device          = require("device")
 local SUIStyle        = require("features/sui_style")
 local Geom            = require("ui/geometry")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan  = require("ui/widget/horizontalspan")
 local LeftContainer   = require("ui/widget/container/leftcontainer")
-local LineWidget      = require("ui/widget/linewidget")
-local OverlapGroup    = require("ui/widget/overlapgroup")
 local Size            = require("ui/size")
 local TextWidget      = require("ui/widget/textwidget")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local VerticalSpan    = require("ui/widget/verticalspan")
+local Widget          = require("ui/widget/widget")
 local Screen          = Device.screen
 local _ = require("infra/sui_i18n").translate
+local DateNames = require("infra/sui_datenames")
 
 local HW = {}
 
@@ -58,36 +57,55 @@ end
 -- Level 0 (no reading at all) is always pure white, regardless of the
 -- gray scale used for levels 1-4 — an empty cell should read as blank,
 -- not as a shade of activity.
+local _level_colors = {}
 function HW.levelColor(level)
     level = level or 0
     if level == 0 then return SUIStyle.COLOR.surface end
-    return Blitbuffer.gray(_LEVEL_GRAY[level + 1] or _LEVEL_GRAY[1])
+    local color = _level_colors[level]
+    if not color then
+        color = Blitbuffer.gray(_LEVEL_GRAY[level + 1] or _LEVEL_GRAY[1])
+        _level_colors[level] = color
+    end
+    return color
 end
 
--- One heatmap square: a thin border-colored square with the level color
--- filled inside, built from two overlapping solid rectangles rather than a
--- bordered FrameContainer (a bordered frame's padding rounding tends to
--- leave a 1px gap at small cell sizes).
-local function buildCell(cell_size, border, fill_color)
+-- A row of heatmap squares drawn by a single widget. `cells[i]` is the fill
+-- color of square i, or false to leave its slot empty. Each square is a thin
+-- border-colored rectangle with the fill rectangle centered inside it, built
+-- from two solid rectangles rather than a bordered FrameContainer (a bordered
+-- frame's padding rounding tends to leave a 1px gap at small cell sizes).
+-- Squares are `cell_size` wide with `gap` pixels between them.
+local function buildCellRow(cell_size, border, gap, cells, count)
     local inner = math.max(1, cell_size - 2 * border)
-    return OverlapGroup:new{
-        dimen = Geom:new{ w = cell_size, h = cell_size },
-        LineWidget:new{ dimen = Geom:new{ w = cell_size, h = cell_size }, background = SUIStyle.COLOR.gray_strong },
-        CenterContainer:new{
-            dimen = Geom:new{ w = cell_size, h = cell_size },
-            LineWidget:new{ dimen = Geom:new{ w = inner, h = inner }, background = fill_color },
-        },
+    local inset = math.floor((cell_size - inner) / 2)
+    local stride = cell_size + gap
+    local row = Widget:new{
+        dimen = Geom:new{ w = count * cell_size + (count - 1) * gap, h = cell_size },
     }
+
+    function row:getSize()
+        return self.dimen
+    end
+
+    function row:paintTo(bb, x, y)
+        self.dimen.x, self.dimen.y = x, y
+        local border_color = SUIStyle.COLOR.gray_strong
+        for i = 1, count do
+            local fill = cells[i]
+            if fill then
+                local cx = x + (i - 1) * stride
+                bb:paintRect(cx, y, cell_size, cell_size, border_color)
+                bb:paintRect(cx + inset, y + inset, inner, inner, fill)
+            end
+        end
+    end
+
+    return row
 end
 
 -- ---------------------------------------------------------------------------
 -- Shared layout bits
 -- ---------------------------------------------------------------------------
-local MONTH_NAMES_SHORT = {
-    _("Jan"), _("Feb"), _("Mar"), _("Apr"), _("May"), _("Jun"),
-    _("Jul"), _("Aug"), _("Sep"), _("Oct"), _("Nov"), _("Dec"),
-}
-
 -- Mon/Wed/Fri row labels down the left side of both grids, three rows
 -- apart (in-between rows unlabeled), same convention as GitHub's own
 -- contribution graph. Row 1 is always Monday — see the file header note on
@@ -190,12 +208,13 @@ function HW.buildRangeHeatmap(daily_map, start_t, end_t, fonts, max_width, opts)
     -- One label per calendar month, on the column where that month starts.
     -- The year is prefixed onto January so a range spanning a year
     -- boundary still shows it somewhere ("2026 Jan").
+    local month_names = DateNames.monthShort()
     local month_label_col = {}
     local last_month = nil
     for col = 1, num_cols do
         for _, d in ipairs(cols[col]) do
             if d.in_range and d.is_month_start and d.month ~= last_month then
-                local text = MONTH_NAMES_SHORT[d.month]
+                local text = month_names[d.month]
                 if d.month == 1 then text = tostring(d.year) .. " " .. text end
                 month_label_col[col] = text
                 last_month = d.month
@@ -245,15 +264,12 @@ function HW.buildRangeHeatmap(daily_map, start_t, end_t, fonts, max_width, opts)
         end
         table.insert(row_group, HorizontalSpan:new{ width = gap })
 
+        local cells = {}
         for col = 1, num_cols do
             local d = cols[col][row]
-            if d.in_range then
-                table.insert(row_group, buildCell(cell_size, border, HW.levelColor(HW.classify(d.seconds, max_seconds))))
-            else
-                table.insert(row_group, HorizontalSpan:new{ width = cell_size })
-            end
-            if col < num_cols then table.insert(row_group, HorizontalSpan:new{ width = gap }) end
+            cells[col] = d.in_range and HW.levelColor(HW.classify(d.seconds, max_seconds)) or false
         end
+        table.insert(row_group, buildCellRow(cell_size, border, gap, cells, num_cols))
         table.insert(widget, row_group)
         if row < 7 then table.insert(widget, VerticalSpan:new{ width = row_gap }) end
     end
@@ -347,11 +363,12 @@ function HW.buildDayPartHeatmap(weekday_hour_map, fonts, max_width, is_12h, opts
         end
         table.insert(row_group, HorizontalSpan:new{ width = gap })
 
+        local cells = {}
         for h = 0, num_cols - 1 do
             local secs = weekday_hour_map[row] and weekday_hour_map[row][h] or 0
-            table.insert(row_group, buildCell(cell_size, border, HW.levelColor(HW.classify(secs, max_seconds))))
-            if h < num_cols - 1 then table.insert(row_group, HorizontalSpan:new{ width = gap }) end
+            cells[h + 1] = HW.levelColor(HW.classify(secs, max_seconds))
         end
+        table.insert(row_group, buildCellRow(cell_size, border, gap, cells, num_cols))
         table.insert(widget, row_group)
         if row < 7 then table.insert(widget, VerticalSpan:new{ width = row_gap }) end
     end
@@ -374,10 +391,9 @@ function HW.buildLegend(fonts, cell_size)
     local row = HorizontalGroup:new{ align = "center" }
     table.insert(row, TextWidget:new{ text = _("Less"), face = fonts.small, fgcolor = SUIStyle.COLOR.text_dim })
     table.insert(row, HorizontalSpan:new{ width = gap * 2 })
-    for level = 0, 4 do
-        table.insert(row, buildCell(cell, border, HW.levelColor(level)))
-        if level < 4 then table.insert(row, HorizontalSpan:new{ width = gap }) end
-    end
+    local levels = {}
+    for level = 0, 4 do levels[level + 1] = HW.levelColor(level) end
+    table.insert(row, buildCellRow(cell, border, gap, levels, 5))
     table.insert(row, HorizontalSpan:new{ width = gap * 2 })
     table.insert(row, TextWidget:new{ text = _("More"), face = fonts.small, fgcolor = SUIStyle.COLOR.text_dim })
     return row

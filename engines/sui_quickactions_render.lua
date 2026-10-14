@@ -20,8 +20,6 @@
 --
 -- Not a registry module (no top-level id/build) — a pure library.
 
-local Blitbuffer = require("ffi/blitbuffer")
-local AAPaint    = require("infra/sui_aa_paint")
 
 -- Widget classes — required lazily, cached in module-local upvalues, so
 -- requiring this engine at plugin load time doesn't force every widget class
@@ -47,7 +45,8 @@ local function Font()            _Font            = _Font            or require(
 local function GestureRange()    _GestureRange    = _GestureRange    or require("ui/gesturerange");                     return _GestureRange    end
 local function WidgetContainer() _WidgetContainer = _WidgetContainer or require("ui/widget/container/widgetcontainer"); return _WidgetContainer end
 
-local logger = require("logger")
+local logger   = require("logger")
+local Backdrop = require("infra/sui_backdrop")
 
 -- Marks `widget` dirty whenever KOReader's theme or night-mode state changes,
 -- so its next paint reflects updated colors. Needed by any widget in this
@@ -165,17 +164,13 @@ function QARenderer.buildIcon(entry, size, fgcolor, opts)
 
     local container_w   = opts.container_w or size
     local container_h   = opts.container_h or size
-    local nerd_scale     = 0.65
-    local fallback_scale = 0.55
-    local icons_face     = style.FACE_ICONS or "symbols"
-    local fallback_face  = opts.fallback_face or "cfont"
 
     local icon_widget
     local nerd_char = Config().nerdIconChar(entry.icon)
     if nerd_char then
         local glyph = ui.makeColoredText{
             text    = nerd_char,
-            face    = Font():getFace(icons_face, math.floor(size * nerd_scale)),
+            face    = style.glyphFace(size),
             fgcolor = fgcolor,
             padding = 0,
         }
@@ -208,7 +203,7 @@ function QARenderer.buildIcon(entry, size, fgcolor, opts)
                 dimen = Geom():new{ w = container_w, h = container_h },
                 ui.makeColoredText{
                     text    = (entry.label and entry.label:sub(1, 1):upper()) or "?",
-                    face    = Font():getFace(fallback_face, math.floor(size * fallback_scale)),
+                    face    = style.letterFace(size, opts.fallback_face),
                     fgcolor = fgcolor,
                     padding = 0,
                 },
@@ -223,15 +218,13 @@ end
 -- Builds a size×size, transparent-background widget that paints the
 -- rounded-rect fill (`bg_color`, when given) and/or border stroke
 -- (`border_color`, `border_sz` thick, when > 0) that sits behind a cell's
--- content. Uses the coverage-based anti-aliasing primitives in
--- infra/sui_aa_paint.lua — the same technique module_clock.lua's analogue
--- face uses — instead of native rounded-rect drawing, which is aliased at
--- the radii this UI uses. Composited via UI.paintWithAlphaMask, once per
--- color, so it sits transparently over whatever is beneath (a wallpaper,
--- when bg_color is nil and only the border is drawn).
--- strength: 0 skip fill, 1–99 scrim via shared backdrop painter, 100 solid AA fill.
+-- content. Both go through the shared backdrop painter in
+-- infra/sui_backdrop.lua: native rectangles plus cached anti-aliased
+-- corner masks, so the cost depends on the corner radius only. The border is
+-- drawn over the fill, and with no fill the wallpaper shows through.
+-- strength: 0 skip fill, 1–99 scrim, 100 solid fill.
 local function _buildRoundedBackdrop(size, corner_r, border_sz, bg_color, border_color, strength)
-    strength = require("features/sui_wallpaper").clampBackdropStrength(strength) or 100
+    strength = Backdrop.clampBackdropStrength(strength) or 100
     local widget = WidgetContainer():new{}
     widget.dimen = Geom():new{ w = size, h = size }
 
@@ -243,39 +236,11 @@ local function _buildRoundedBackdrop(size, corner_r, border_sz, bg_color, border
         self.dimen.x, self.dimen.y = x, y
         if size <= 0 then return end
 
-        if bg_color and strength > 0 and strength < 100 then
-            local ok, WP = pcall(require, "features/sui_wallpaper")
-            if ok and WP and WP.paintBackdrop then
-                WP.paintBackdrop(bb, x, y, size, size, strength, corner_r, bg_color)
-            end
-        end
-
-        if not self._tmp_bb or self._tmp_bb:getWidth() ~= size then
-            if self._tmp_bb then self._tmp_bb:free() end
-            self._tmp_bb = Blitbuffer.new(size, size, Blitbuffer.TYPE_BB8)
-        end
-
-        local ui = UI()
-        if bg_color and strength >= 100 then
-            ui.paintWithAlphaMask(self, bb, x, y, size, size, bg_color, function(_w, tmp_bb)
-                AAPaint.paintRoundedRectFill(tmp_bb, 0, 0, size, size, corner_r, 0, 0, size - 1, size - 1)
-            end, self._tmp_bb)
+        if bg_color and strength > 0 then
+            Backdrop.paintBackdrop(bb, x, y, size, size, strength, corner_r, bg_color)
         end
         if border_sz > 0 then
-            local half = border_sz / 2
-            ui.paintWithAlphaMask(self, bb, x, y, size, size, border_color, function(_w, tmp_bb)
-                AAPaint.paintRoundedRectStroke(tmp_bb, half, half, size - border_sz, size - border_sz,
-                    math.max(0, corner_r - half), border_sz, 0, 0, size - 1, size - 1)
-            end, self._tmp_bb)
-        end
-    end
-
-    function widget:onCloseWidget() self:free() end
-
-    function widget:free()
-        if self._tmp_bb then
-            self._tmp_bb:free()
-            self._tmp_bb = nil
+            Backdrop.paintFrame(bb, x, y, size, size, border_sz, corner_r, border_color)
         end
     end
 
@@ -315,7 +280,7 @@ function QARenderer.buildFrame(inner_widget, size, opts)
     local is_bare = (shape == "bare")
 
     -- Fill opacity: explicit opts.strength, else transparent → 0, solid/flat → 100.
-    local strength = require("features/sui_wallpaper").clampBackdropStrength(opts.strength)
+    local strength = Backdrop.clampBackdropStrength(opts.strength)
     if strength == nil then
         strength = (bg == "transparent") and 0 or 100
     end
@@ -414,7 +379,7 @@ function QARenderer.buildFramedIcon(file, size, fgcolor)
         widget._fg   = fgcolor
         local tw = TextWidget():new{
             text    = nerd_char,
-            face    = Font():getFace(style.FACE_ICONS or "symbols", math.floor(size * 0.75)),
+            face    = style.glyphFace(size),
             fgcolor = fgcolor,
             padding = 0,
         }

@@ -2,7 +2,6 @@
 -- Clock module with ordered, show/hide items (clock, date, battery).
 -- Supports "digital", "word" and "analogue" clock styles.
 
-local Blitbuffer      = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local datetime        = require("datetime")
 local Device          = require("device")
@@ -17,11 +16,13 @@ local Screen          = Device.screen
 local _ = require("infra/sui_i18n").translate
 
 local UI           = require("infra/sui_core")
+local DateNames    = require("infra/sui_datenames")
 local UIManager    = require("ui/uimanager")
 local SUIStyle     = require("features/sui_style")
 local Config       = require("infra/sui_config")
 local SUISettings = require("infra/sui_store")
 local AAPaint      = require("infra/sui_aa_paint")
+local RasterCache  = require("infra/sui_raster_cache")
 local PAD          = UI.PAD
 local CLR_TEXT_SUB = UI.CLR_TEXT_SUB
 
@@ -30,13 +31,6 @@ local CLR_TEXT_SUB = UI.CLR_TEXT_SUB
 -- os.date("%A, %d %B") always returns English on most eReader locales.
 -- We use os.date("*t") for the numeric indices and look up translated names.
 -- ---------------------------------------------------------------------------
-
--- _WEEKDAYS and _MONTHS are intentionally NOT built at module-load time so
--- that _() is called after the user's locale has been applied. They are built
--- on the first _localDate() call and reused from that point on — the locale
--- never changes within a running KOReader session, so caching is safe.
-local _weekdays = nil
-local _months   = nil
 
 local function _localDate()
     -- Pass os.time() explicitly: os.date("*t") without argument can return
@@ -48,20 +42,8 @@ local function _localDate()
         -- Fallback via the datetime module's locale-aware formatter.
         return datetime.secondsToDate(now, true)
     end
-    -- Build translation tables on first call only; never recreated afterwards.
-    if not _weekdays then
-        _weekdays = {
-            _("Sunday"), _("Monday"), _("Tuesday"), _("Wednesday"),
-            _("Thursday"), _("Friday"), _("Saturday"),
-        }
-        _months = {
-            _("January"), _("February"), _("March"),     _("April"),
-            _("May"),     _("June"),     _("July"),       _("August"),
-            _("September"), _("October"), _("November"),  _("December"),
-        }
-    end
-    local weekday = _weekdays[t.wday] or os.date("%A", now)
-    local month   = _months[t.month]  or os.date("%B", now)
+    local weekday = DateNames.weekdayFull()[t.wday] or os.date("%A", now)
+    local month   = DateNames.monthFull()[t.month]  or os.date("%B", now)
     return string.format("%s, %d %s", weekday, t.day, month)
 end
 
@@ -128,7 +110,6 @@ local SETTING_BATT_GAP  = "clock_batt_gap"
 local SETTING_ALIGN     = "clock_align"       -- pfx .. "clock_align"     (default "center")
 local SETTING_STYLE     = "clock_style"       -- pfx .. "clock_style"     ("digital"|"word"|"analogue")
 
-local ALIGN_VALUES = { "left", "center", "right" }
 local STYLE_VALUES = { "digital", "word", "analogue" }
 
 -- Fixed item keys, in the default top-to-bottom order.
@@ -140,30 +121,12 @@ local ITEM_VIS_KEY = {
     battery = SETTING_BATTERY,
 }
 
--- Reads a setting and validates it against a fixed list of allowed values,
--- falling back to `default` for unset or corrupted entries.
-local function _readEnum(pfx, key, values, default)
-    local v = SUISettings:readSetting(pfx .. key)
-    for _, allowed in ipairs(values) do if allowed == v then return v end end
-    return default
-end
-
 local function getAlignment(pfx)
-    return _readEnum(pfx, SETTING_ALIGN, ALIGN_VALUES, "center")
-end
-
-local function setAlignment(pfx, val)
-    SUISettings:saveSetting(pfx .. SETTING_ALIGN, val)
-end
-
-local function alignLabel(align, _lc)
-    if align == "left"  then return _lc("Left")  end
-    if align == "right" then return _lc("Right") end
-    return _lc("Center")
+    return Config.getAlignment(pfx .. SETTING_ALIGN)
 end
 
 local function getClockStyle(pfx)
-    return _readEnum(pfx, SETTING_STYLE, STYLE_VALUES, "digital")
+    return Config.readChoice(pfx .. SETTING_STYLE, STYLE_VALUES, "digital")
 end
 
 local function setClockStyle(pfx, val)
@@ -468,14 +431,11 @@ end
 -- clock" device setting the digital style honours — an analogue dial has no
 -- 24-hour convention to switch to.
 --
--- Composited over the target with UI.paintWithAlphaMask so it sits
--- transparently over a wallpaper, the same way UI.makeColoredText composites
--- coloured text — this drawing routine just fills the role that
--- TextWidget:paintTo plays there.
+-- The face is rasterised into a coverage mask and composited in the clock's
+-- colour, so it sits transparently over a wallpaper.
 
--- Draws the face into `bb` (assumed already white-filled, size diameter ×
--- diameter), in BLACK ink — UI.paintWithAlphaMask inverts and recolours it
--- afterwards.
+-- Draws the face into `bb` (white-filled, size diameter × diameter), in BLACK
+-- ink; AAPaint.buildMask turns the ink into coverage.
 local function _drawAnalogueFace(bb, diameter, hour, min)
     local cx, cy = diameter / 2, diameter / 2
     local r      = diameter / 2
@@ -513,47 +473,48 @@ local function _drawAnalogueFace(bb, diameter, hour, min)
     drawHand(minute_angle, diameter * 0.40, diameter * 0.022)
 end
 
+-- Coverage mask of the whole face, cached per size and 12-hour time. Ticks and
+-- hands overlap, so they are rasterised together rather than as two layers.
+local function _buildFaceMask(diameter, hour12, min)
+    return { bb = AAPaint.buildMask(diameter, diameter, function(bb)
+        _drawAnalogueFace(bb, diameter, hour12, min)
+    end) }
+end
+
+-- Current time on a 12-hour dial: hour (0-11) and minute.
+local function _dialTime()
+    local t = os.date("*t", os.time())
+    return t.hour % 12, t.min
+end
+
 -- Builds a transparent-background widget of size diameter × diameter showing
--- the current time as an analogue face in `fg_color`. Mirrors the structure
--- of UI.makeColoredText (offscreen 8-bit buffer, painted in BLACK, composited
--- via UI.paintWithAlphaMask) — the only difference is the paint routine
--- draws clock-face primitives instead of rendering a TextWidget.
+-- the current time as an analogue face in `fg_color`.
 local function _buildAnalogueClockWidget(diameter, fg_color)
     if diameter < 2 then return nil end
-    local t   = os.date("*t", os.time())
-    local hour, min = t.hour, t.min
 
     local widget = WidgetContainer:new{}
     widget.dimen = Geom:new{ w = diameter, h = diameter }
+    widget.hour12, widget.min = _dialTime()
 
     function widget:getSize()
         return self.dimen
+    end
+
+    -- Moves the hands to the current time. Returns true when they moved.
+    function widget:syncTime()
+        local hour12, min = _dialTime()
+        if hour12 == self.hour12 and min == self.min then return false end
+        self.hour12, self.min = hour12, min
+        return true
     end
 
     function widget:paintTo(bb, x, y)
         self.dimen.x, self.dimen.y = x, y
         local d = self.dimen.w
         if d <= 0 then return end
-
-        if not self._tmp_bb or self._tmp_bb:getWidth() ~= d or self._tmp_bb:getHeight() ~= d then
-            if self._tmp_bb then self._tmp_bb:free() end
-            self._tmp_bb = Blitbuffer.new(d, d, Blitbuffer.TYPE_BB8)
-        end
-
-        local custom_paint_fn = function(_widget, tmp_bb)
-            _drawAnalogueFace(tmp_bb, d, hour, min)
-        end
-
-        UI.paintWithAlphaMask(widget, bb, x, y, d, d, fg_color, custom_paint_fn, self._tmp_bb)
-    end
-
-    function widget:onCloseWidget() self:free() end
-
-    function widget:free()
-        if self._tmp_bb then
-            self._tmp_bb:free()
-            self._tmp_bb = nil
-        end
+        local face = RasterCache.get("clock_face", (d * 12 + self.hour12) * 60 + self.min,
+            _buildFaceMask, d, self.hour12, self.min).bb
+        bb:colorblitFromRGB32(face, x, y, 0, 0, d, d, fg_color)
     end
 
     return widget
@@ -596,6 +557,16 @@ local function _battText(lvl, charging)
     else                  bars = "▱▱▱▱" end
     local icon = charging and ("⚡" .. bars:sub(4)) or bars
     return string.format("%s %d%%", icon, lvl)
+end
+
+-- Battery display string for the current charge state.
+local function _battLabel()
+    return _battText(_battInfo())
+end
+
+-- Digital time string, honouring the device's 12/24-hour setting.
+local function _timeText()
+    return datetime.secondsToHour(os.time(), G_reader_settings:isTrue("twelve_hour_clock"))
 end
 
 -- ---------------------------------------------------------------------------
@@ -642,7 +613,12 @@ end
 -- scale only. `w` is already the column width in landscape spread, so
 -- applying lf again would shrink twice (same convention as GridRenderer).
 -- `styles` (text style per element) is read from settings when omitted.
-local function build(w, pfx, vspan_pool, landscape_factor, styles)
+-- `live`, when given, receives what _updateInPlace needs to refresh the built
+-- widget without rebuilding it:
+--   texts — { widget, text } per text widget, `text` returning its current string
+--           (nil for the word style, whose lines change size almost every minute)
+--   face  — the analogue face widget, if any
+local function build(w, pfx, vspan_pool, landscape_factor, styles, live)
     local lf    = landscape_factor or 1
     _migrateLegacyElemScales(pfx)
     styles = styles or Config.readTextStyles("clock", TEXT_ELEMS, pfx)
@@ -670,6 +646,7 @@ local function build(w, pfx, vspan_pool, landscape_factor, styles)
 
     local align = getAlignment(pfx)
     local vg = VerticalGroup:new{ align = align }
+    local texts, face_widget = {}, nil
 
     local function appendClock()
         if clock_style == "word" then
@@ -681,38 +658,45 @@ local function build(w, pfx, vspan_pool, landscape_factor, styles)
         elseif clock_style == "analogue" then
             local diameter = math.min(clock_span, w)
             if diameter % 2 == 1 then diameter = diameter - 1 end
-            local face_widget = _buildAnalogueClockWidget(diameter, SUIStyle.COLOR.text_primary)
+            face_widget = _buildAnalogueClockWidget(diameter, SUIStyle.COLOR.text_primary)
             if face_widget then vg[#vg+1] = face_widget end
         else
             local face_clock, bold_clock = SUIStyle.getTextFace(styles.clock, clock_fs)
-            local time_text = datetime.secondsToHour(os.time(), G_reader_settings:isTrue("twelve_hour_clock"))
-            vg[#vg+1] = _slot(UI.makeColoredText{
+            local time_text = _timeText()
+            -- No fgcolor: makeColoredText returns a plain TextWidget, which
+            -- must record its own on-screen box for in-place refreshes.
+            local time_w = UI.trackDimen(UI.makeColoredText{
                 text = time_text,
                 face = face_clock,
                 bold = bold_clock,
-            }, clock_w, SUIStyle.inkCentreShift(face_clock, time_text, bold_clock))
+            })
+            vg[#vg+1] = _slot(time_w, clock_w, SUIStyle.inkCentreShift(face_clock, time_text, bold_clock))
+            texts[#texts+1] = { widget = time_w, text = _timeText }
         end
     end
 
     local function appendDate()
         local face_date, bold_date = SUIStyle.getTextFace(styles.date, date_fs)
-        vg[#vg+1] = _slot(UI.makeColoredText{
+        local date_w = UI.makeColoredText{
             text    = _localDate(),
             face    = face_date,
             bold    = bold_date,
             fgcolor = sub_fg,
-        }, date_h)
+        }
+        vg[#vg+1] = _slot(date_w, date_h)
+        texts[#texts+1] = { widget = date_w, text = _localDate }
     end
 
     local function appendBattery()
-        local lvl, charging = _battInfo()
         local face_batt, bold_batt = SUIStyle.getTextFace(styles.battery, batt_fs)
-        vg[#vg+1] = _slot(UI.makeColoredText{
-            text    = _battText(lvl, charging),
+        local batt_w = UI.makeColoredText{
+            text    = _battLabel(),
             face    = face_batt,
             bold    = bold_batt,
             fgcolor = sub_fg,
-        }, batt_h)
+        }
+        vg[#vg+1] = _slot(batt_w, batt_h)
+        texts[#texts+1] = { widget = batt_w, text = _battLabel }
     end
 
     local appenders = {
@@ -728,6 +712,11 @@ local function build(w, pfx, vspan_pool, landscape_factor, styles)
     end
 
     if #vg == 0 then return nil end
+
+    if live then
+        live.texts = clock_style ~= "word" and texts or nil
+        live.face  = face_widget
+    end
 
     -- `fit_align` makes the module chrome hug the content and position it
     -- within the column (see ModuleChrome.wrap). Horizontal insets come from
@@ -777,17 +766,112 @@ end
 M.getCountLabel = nil
 
 -- ---------------------------------------------------------------------------
--- Surgical clock tick — rebuilds only the clock widget inside the body
--- VerticalGroup, without triggering a full homescreen rebuild.
+-- Surgical clock tick — refreshes the clock module without triggering a full
+-- homescreen rebuild. Two paths:
+--   • _updateInPlace — swaps the text of the mounted widgets (and moves the
+--     analogue hands) and refreshes only the boxes that changed.
+--   • _rebuildModule — rebuilds the module widget inside the body
+--     VerticalGroup and refreshes the whole module region. Used when a text
+--     changes size (neighbours would move) and for the word style.
 --
 -- The homescreen records _clock_body_ref, _clock_body_idx, and
--- _clock_is_wrapped during _buildContent() (see below).  The tick reads
--- those fields to do a targeted swap, then marks only the navbar container
--- dirty.  Falls back to a full _refresh() if the index was not recorded.
+-- _clock_is_wrapped during _buildContent() (see below).  The rebuild path
+-- reads those fields to do a targeted swap, then marks only the module's
+-- region dirty.  Falls back to a full _refresh() if the index was not recorded.
 -- ---------------------------------------------------------------------------
 
 local _timer         = nil   -- scheduled function reference (module-level singleton)
 local _screen_widget = nil   -- weak reference to the live ScreenWidget (Homescreen or Custom Screen)
+
+-- Refreshes the mounted clock in place, using the widgets recorded by build()
+-- in screen._clock_live. Returns true when the screen is up to date (nothing
+-- changed, or only the changed boxes were refreshed) and false when the module
+-- must be rebuilt.
+local function _updateInPlace(screen)
+    local live = screen._clock_live
+    if not (live and live.texts and screen._navbar_container) then return false end
+
+    local updates = {}
+    for i, entry in ipairs(live.texts) do
+        updates[i] = { widget = entry.widget, text = entry.text() }
+    end
+    local changed = UI.setTextsInPlace(updates)
+    if not changed then return false end
+
+    if live.face and live.face:syncTime() then changed[#changed + 1] = live.face end
+    UI.refreshBoxes(screen, changed)
+    return true
+end
+
+-- Rebuilds the clock module widget and swaps it into its slot, refreshing the
+-- module's whole region. Returns false when the fallback page rebuild fails.
+local function _rebuildModule(screen)
+    local body       = screen._clock_body_ref
+    local idx        = screen._clock_body_idx
+    local is_wrapped = screen._clock_is_wrapped
+
+    if body and idx and body[idx] and screen._navbar_container then
+        local sw      = Screen:getWidth()
+        local inner_w = screen._clock_inner_w or UI.getInnerW(sw)
+
+        -- Pass the screen's landscape factor through explicitly so the
+        -- surgical swap matches the size _updatePage would have built.
+        local lf = screen._clock_landscape_factor
+
+        local ok_ch, Chrome = pcall(require, "features/sui_module_chrome")
+        local pfx = screen._clock_pfx or "simpleui_hs_"
+        local chrome = ok_ch and Chrome and Chrome.resolve(pfx, "clock") or nil
+        local col_w = screen._clock_col_w
+        if not col_w and chrome then
+            col_w = inner_w + Chrome.outerMargin(chrome) * 2
+                + Chrome.boxInset(chrome)
+        end
+        col_w = col_w or inner_w
+
+        -- Build at the same content width the page path would use.
+        local build_w = (chrome and Chrome.contentWidth(col_w, chrome)) or inner_w
+        local live = {}
+        local ok_w, new_widget = pcall(build, build_w, pfx, screen._vspan_pool, lf, nil, live)
+
+        if ok_w and new_widget then
+            -- Re-apply module chrome so the surgical swap keeps the same
+            -- fill/frame width the full page build would have wrapped.
+            if chrome then
+                new_widget = Chrome.wrap(new_widget, chrome, col_w, lf or 1)
+            end
+            local target
+            if is_wrapped then
+                -- The clock was wrapped in an InputContainer for hold-to-settings.
+                -- Replace the inner slot [1] to keep the gesture handler alive.
+                body[idx][1] = new_widget
+                target = body[idx]
+            else
+                body[idx] = new_widget
+                target = new_widget
+            end
+            screen._clock_live = live
+            -- Scope the e-ink refresh to the clock's own region instead of the
+            -- whole screen, the same convention used for other in-place widget
+            -- swaps (see ScreenWidget:_refreshBookModSlot). The dimen is read
+            -- lazily via the callback, after the paint pass has positioned
+            -- `target`, so it reflects the widget's real on-screen coordinates.
+            UIManager:setDirty(screen, function() return "ui", target.dimen end)
+            return true
+        end
+    end
+
+    -- Slow-path fallback — only triggered when the clock module is on the
+    -- current page but build() failed (e.g. transient font-cache miss).
+    -- Use _updatePage(true) directly — same as the original _clockTick:
+    -- immediate, keeps book/stats caches intact, no unnecessary DB roundtrips.
+    if screen._navbar_container then
+        return (pcall(function()
+            screen:_updatePage(true)
+            UIManager:setDirty(screen, "ui")
+        end))
+    end
+    return true
+end
 
 local function _tick()
     _timer = nil   -- timer has fired; clear before rescheduling
@@ -836,74 +920,11 @@ local function _tick()
         return
     end
 
-    -- Fast path: swap only the clock widget in the body VerticalGroup.
-    local body       = screen._clock_body_ref
-    local idx        = screen._clock_body_idx
-    local is_wrapped = screen._clock_is_wrapped
-    local swapped    = false
-
-    if body and idx and body[idx] and screen._navbar_container then
-        local sw      = Screen:getWidth()
-        local inner_w = screen._clock_inner_w or UI.getInnerW(sw)
-
-        -- Pass the screen's landscape factor through explicitly so the
-        -- surgical swap matches the size _updatePage would have built.
-        local lf = screen._clock_landscape_factor
-
-        local ok_ch, Chrome = pcall(require, "features/sui_module_chrome")
-        local pfx = screen._clock_pfx or "simpleui_hs_"
-        local chrome = ok_ch and Chrome and Chrome.resolve(pfx, "clock") or nil
-        local col_w = screen._clock_col_w
-        if not col_w and chrome then
-            col_w = inner_w + Chrome.outerMargin(chrome) * 2
-                + Chrome.innerPad(chrome) * 2 + Chrome.borderSz(chrome) * 2
-        end
-        col_w = col_w or inner_w
-
-        -- Build at the same content width the page path would use.
-        local build_w = (chrome and Chrome.contentWidth(col_w, chrome)) or inner_w
-        local ok_w, new_widget = pcall(build, build_w, pfx, screen._vspan_pool, lf)
-
-        if ok_w and new_widget then
-            -- Re-apply module chrome so the surgical swap keeps the same
-            -- fill/frame width the full page build would have wrapped.
-            if chrome then
-                new_widget = Chrome.wrap(new_widget, chrome, col_w, lf or 1)
-            end
-            local target
-            if is_wrapped then
-                -- The clock was wrapped in an InputContainer for hold-to-settings.
-                -- Replace the inner slot [1] to keep the gesture handler alive.
-                body[idx][1] = new_widget
-                target = body[idx]
-            else
-                body[idx] = new_widget
-                target = new_widget
-            end
-            -- Scope the e-ink refresh to the clock's own region instead of the
-            -- whole screen, the same convention used for other in-place widget
-            -- swaps (see ScreenWidget:_refreshBookModSlot). The dimen is read
-            -- lazily via the callback, after the paint pass has positioned
-            -- `target`, so it reflects the widget's real on-screen coordinates.
-            UIManager:setDirty(screen, function() return "ui", target.dimen end)
-            swapped = true
-        end
-    end
-
-    if not swapped then
-        -- Slow-path fallback — only triggered when the clock module is on the
-        -- current page but build() failed (e.g. transient font-cache miss).
-        -- idx == nil means clock is simply not on the current page: nothing to
-        -- repaint, so skip the rebuild entirely.
-        -- Use _updatePage(true) directly — same as the original _clockTick:
-        -- immediate, keeps book/stats caches intact, no unnecessary DB roundtrips.
-        if idx ~= nil and screen._navbar_container then
-            local ok = pcall(function()
-                screen:_updatePage(true)
-                UIManager:setDirty(screen, "ui")
-            end)
-            if not ok then _screen_widget = nil; return end
-        end
+    -- Same-size text changes are refreshed in place; anything else rebuilds
+    -- the module. idx == nil means the clock module is not on the current
+    -- page: nothing to repaint.
+    if screen._clock_body_idx ~= nil and not _updateInPlace(screen) then
+        if not _rebuildModule(screen) then _screen_widget = nil; return end
     end
 
     -- ---------------------------------------------------------------------------
@@ -968,8 +989,10 @@ function M.build(w, ctx)
         -- Full column width for surgical re-wrap (set by screen engine).
         ctx._screen_widget._clock_col_w    = ctx.col_w
     end
+    local live = {}
+    if ctx._screen_widget then ctx._screen_widget._clock_live = live end
     return build(w, ctx.pfx, ctx.vspan_pool, ctx.landscape_factor,
-        Config.resolveTextStyles(ctx, M.id, TEXT_ELEMS))
+        Config.resolveTextStyles(ctx, M.id, TEXT_ELEMS), live)
 end
 
 function M.getHeight(ctx)
@@ -1095,26 +1118,15 @@ function M.getMenuItems(ctx_menu)
                     on_tap       = function()
                         local sort_items = {}
                         for _, key in ipairs(getItemOrder(pfx)) do
-                            local _key = key
-                            local hidden = not isItemVisible(pfx, _key)
-                            local item = {
-                                text        = itemLabel(_key, _lc),
-                                orig_item   = _key,
-                                dim_row     = hidden or nil,
-                                -- Eye glyph reflects current state: open while
-                                -- visible, closed once hidden.
-                                toggle_icon = hidden and "hide" or "show",
-                            }
-                            item.on_toggle = function()
-                                local now_hidden = not isItemVisible(pfx, _key)
-                                setItemVisible(pfx, _key, now_hidden)
-                                local hidden2 = not isItemVisible(pfx, _key)
-                                item.dim_row     = hidden2 or nil
-                                item.toggle_icon = hidden2 and "hide" or "show"
-                                refresh()
-                                ctx.repaint()
-                            end
-                            sort_items[#sort_items + 1] = item
+                            sort_items[#sort_items + 1] = Config.applyVisibilityToggle({
+                                text      = itemLabel(key, _lc),
+                                orig_item = key,
+                            }, {
+                                is_visible  = function() return isItemVisible(pfx, key) end,
+                                set_visible = function(visible) setItemVisible(pfx, key, visible) end,
+                                on_change   = refresh,
+                                repaint     = ctx.repaint,
+                            })
                         end
                         ctx.push("arrange", {
                             title      = _lc("Items"),
@@ -1200,33 +1212,11 @@ function M.getMenuItems(ctx_menu)
             },
         },
     }
-    appearance_extra[#appearance_extra + 1] = {
-        text_func  = function() return _lc("Alignment") end,
-        value_func = function() return alignLabel(getAlignment(pfx), _lc) end,
-        separator      = true,
-        sub_item_table = {
-            {
-                text           = _lc("Left"),
-                radio          = true,
-                checked_func   = function() return getAlignment(pfx) == "left" end,
-                keep_menu_open = true,
-                callback       = function() setAlignment(pfx, "left"); refresh() end,
-            },
-            {
-                text           = _lc("Center"),
-                radio          = true,
-                checked_func   = function() return getAlignment(pfx) == "center" end,
-                keep_menu_open = true,
-                callback       = function() setAlignment(pfx, "center"); refresh() end,
-            },
-            {
-                text           = _lc("Right"),
-                radio          = true,
-                checked_func   = function() return getAlignment(pfx) == "right" end,
-                keep_menu_open = true,
-                callback       = function() setAlignment(pfx, "right"); refresh() end,
-            },
-        },
+    appearance_extra[#appearance_extra + 1] = Config.makeAlignmentItem{
+        key       = pfx .. SETTING_ALIGN,
+        separator = true,
+        refresh   = refresh,
+        _lc       = _lc,
     }
 
     if #getVisibleItems(pfx) > 1 then

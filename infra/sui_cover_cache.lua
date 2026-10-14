@@ -79,6 +79,8 @@
 -- than the target slot.
 
 local logger = require("logger")
+local RasterCache = require("infra/sui_raster_cache")
+local _bbBytes = RasterCache.bbBytes   -- resident bytes; this cache is bounded by bytes, not entry count
 
 -- Per-cover cache logging is verbose (one line per PUT/EVICT) and, because
 -- Lua evaluates the string.format() argument before logger.dbg can discard
@@ -86,27 +88,6 @@ local logger = require("logger")
 -- debug logging off. Gate it behind a constant so production pays nothing;
 -- flip to true when diagnosing cache churn.
 local _PERF_LOG = false
-
--- Resident byte size of a cached cover bb. `stride` is the bytes-per-row of
--- the underlying C allocation, so `stride * h` is the true RAM footprint
--- INCLUDING any row padding — and it scales correctly with both cover
--- dimensions and bit depth (1 byte/px on grayscale e-ink vs 4 bytes/px
--- RGB32 on a colour panel) without the cache needing to know the device
--- type. This is why the cache is bounded by BYTES, not entry count: "40
--- covers" is a few MiB of small grayscale thumbnails or tens of MiB of
--- large colour hero covers — same count, very different RAM.
-local function _bbBytes(bb)
-    if not bb then return 0 end
-    local ok, n = pcall(function()
-        local h = (bb.getHeight and bb:getHeight()) or tonumber(bb.h) or 0
-        local stride = tonumber(bb.stride)
-        if stride and h > 0 then return stride * h end
-        local w   = (bb.getWidth and bb:getWidth()) or 0
-        local bpp = (bb.getBpp and bb:getBpp()) or 8
-        return w * h * math.ceil(bpp / 8)
-    end)
-    return (ok and n) or 0
-end
 
 local SUICoverCache = {
     -- Bounded by RAM, in BYTES — see _bbBytes above. ~20 MiB default:
@@ -117,15 +98,17 @@ local SUICoverCache = {
     -- across two separate tables.
     --
     -- _capacity is a non-user-facing entry-COUNT backstop, kept only to
-    -- bound the O(n) _order scans in get/put and guard against a
+    -- bound the O(n) oldest-entry scan done on eviction and guard against a
     -- pathological many-tiny-covers case. Set high enough that the byte
     -- budget always binds first for normal budgets.
     _capacity    = 512,
     _byte_budget = 20 * 1024 * 1024,
     _bytes       = 0,   -- running sum of resident entry bytes (see _sizes)
+    _count       = 0,   -- number of resident entries
     _cache       = {},  -- filepath -> bb
-    _order       = {},  -- list of filepaths, oldest at front, MRU at back
+    _ticks       = {},  -- filepath -> tick of the last access (higher = more recent)
     _sizes       = {},  -- filepath -> bytes, so evict/replace adjust _bytes O(1)
+    _tick        = 0,   -- monotonic access counter
     _hits        = 0,   -- perf: cache hits this session
     _puts        = 0,   -- perf: cache misses (fresh stretch) this session
     _evictions   = 0,   -- perf: evictions this session
@@ -157,34 +140,40 @@ function SUICoverCache:setByteBudget(bytes)
     self:_evictIfNeeded()
 end
 
-function SUICoverCache:_removeKey(key)
-    for i, k in ipairs(self._order) do
-        if k == key then
-            table.remove(self._order, i)
-            return
-        end
-    end
+-- Marks `key` as the most recently used entry. O(1).
+function SUICoverCache:_touch(key)
+    self._tick = self._tick + 1
+    self._ticks[key] = self._tick
+end
+
+-- Drops the cache's reference to `key` and its accounting. Does NOT free the
+-- bb — see the lifetime note at the top of this file.
+function SUICoverCache:_removeEntry(key)
+    self._cache[key] = nil
+    self._ticks[key] = nil
+    self._bytes = math.max(0, self._bytes - (self._sizes[key] or 0))
+    self._sizes[key] = nil
+    self._count = self._count - 1
 end
 
 function SUICoverCache:_evictIfNeeded()
-    -- Evict oldest until BOTH bounds hold: entry count <= capacity AND
-    -- resident bytes <= byte budget. Keep at least the most-recently
-    -- inserted entry (#order > 1 guard) so a single oversized cover can't
-    -- evict itself right after being cached.
-    while #self._order > 1
-          and (#self._order > self._capacity or self._bytes > self._byte_budget) do
-        local key = table.remove(self._order, 1)
-        -- Drop the cache's reference only. Don't call bb:free() — see the
-        -- lifetime note at the top of this file; ImageWidgets that still
-        -- hold this bb would render garbage pixels on their next paint.
-        self._cache[key] = nil
-        self._bytes = self._bytes - (self._sizes[key] or 0)
-        if self._bytes < 0 then self._bytes = 0 end
-        self._sizes[key] = nil
+    -- Evict the least recently used entry until BOTH bounds hold: entry
+    -- count <= capacity AND resident bytes <= byte budget. Keep at least the
+    -- most-recently used entry (count > 1 guard) so a single oversized cover
+    -- can't evict itself right after being cached.
+    while self._count > 1
+          and (self._count > self._capacity or self._bytes > self._byte_budget) do
+        local oldest_key, oldest_tick
+        for key, tick in pairs(self._ticks) do
+            if not oldest_tick or tick < oldest_tick then
+                oldest_key, oldest_tick = key, tick
+            end
+        end
+        self:_removeEntry(oldest_key)
         self._evictions = self._evictions + 1
         if _PERF_LOG then logger.dbg(string.format(
             "[simpleui perf] SUICoverCache: EVICT fp=%s size=%d/%d bytes=%d/%d",
-            key, #self._order, self._capacity, self._bytes, self._byte_budget)) end
+            oldest_key, self._count, self._capacity, self._bytes, self._byte_budget)) end
     end
 end
 
@@ -197,8 +186,7 @@ function SUICoverCache:get(filepath)
     local bb = self._cache[filepath]
     if not bb then return nil end
     self._hits = self._hits + 1
-    self:_removeKey(filepath)
-    self._order[#self._order + 1] = filepath
+    self:_touch(filepath)
     return bb
 end
 
@@ -244,31 +232,28 @@ function SUICoverCache:put(filepath, bb)
             -- Keep existing; touch MRU. Do NOT free the caller's bb — they
             -- may have another use for it. Returning existing tells the
             -- caller "use this instead".
-            self:_removeKey(filepath)
-            self._order[#self._order + 1] = filepath
+            self:_touch(filepath)
             return existing
         end
         -- New is larger; replace the cache reference. Do NOT free existing
         -- — other live widgets may still hold it (see lifetime note at the
-        -- top of this file). Drop the old entry's byte accounting; the new
-        -- size is added below.
-        self:_removeKey(filepath)
-        self._bytes = self._bytes - (self._sizes[filepath] or 0)
-        if self._bytes < 0 then self._bytes = 0 end
-        self._sizes[filepath] = nil
+        -- top of this file). Drop the old entry's accounting; the new
+        -- entry's is added below.
+        self:_removeEntry(filepath)
     end
-    self._cache[filepath] = bb
-    self._order[#self._order + 1] = filepath
     local nbytes = _bbBytes(bb)
+    self._cache[filepath] = bb
     self._sizes[filepath] = nbytes
     self._bytes = self._bytes + nbytes
+    self._count = self._count + 1
     self._puts = self._puts + 1
+    self:_touch(filepath)
     if _PERF_LOG then logger.dbg(string.format(
         "[simpleui perf] SUICoverCache: PUT fp=%s %dx%d size=%d/%d bytes=%d/%d hits=%d puts=%d",
         filepath,
         (bb.getWidth and bb:getWidth() or 0),
         (bb.getHeight and bb:getHeight() or 0),
-        #self._order, self._capacity, self._bytes, self._byte_budget,
+        self._count, self._capacity, self._bytes, self._byte_budget,
         self._hits, self._puts)) end
     self:_evictIfNeeded()
     return bb
@@ -282,11 +267,7 @@ end
 function SUICoverCache:drop(filepath)
     if not filepath or filepath == "" then return end
     if self._cache[filepath] == nil then return end
-    self._bytes = self._bytes - (self._sizes[filepath] or 0)
-    if self._bytes < 0 then self._bytes = 0 end
-    self._cache[filepath] = nil
-    self._sizes[filepath] = nil
-    self:_removeKey(filepath)
+    self:_removeEntry(filepath)
 end
 
 -- clear() — drop every cached reference. Same lifetime contract as put: we
@@ -297,9 +278,11 @@ function SUICoverCache:clear()
         "[simpleui perf] SUICoverCache: clear hits=%d puts=%d evictions=%d",
         self._hits, self._puts, self._evictions)) end
     self._cache     = {}
-    self._order     = {}
+    self._ticks     = {}
     self._sizes     = {}
     self._bytes     = 0
+    self._count     = 0
+    self._tick      = 0
     self._hits      = 0
     self._puts      = 0
     self._evictions = 0

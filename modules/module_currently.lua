@@ -32,6 +32,7 @@ local SectionLabel = require("engines/sui_section_label")
 local UI           = require("infra/sui_core")
 local SUISettings  = require("infra/sui_store")
 local SUIStyle     = require("features/sui_style")
+local Chrome       = require("features/sui_module_chrome")
 local PAD          = UI.PAD
 local LABEL_H      = UI.LABEL_H
 local CLR_TEXT_SUB = UI.CLR_TEXT_SUB
@@ -90,6 +91,66 @@ local _BASE_SERIES_FS    = SUIStyle.FS_CAPTION    -- 12: series text (smaller th
 -- elements, so a taller fixed value costs no layout risk — just card height.
 local DESC_MAX_LINES = 8
 
+-- Layout plans: the cover size, text width and description clamp resolved by
+-- the measuring passes of M.build(). A plan is reused while every input of
+-- those passes is unchanged, so repeat builds (page turns, refreshes) render
+-- the text column once. Weak-keyed by the settings bundle: replacing the
+-- bundle drops its plans. Keys carry the book content, so the per-bundle
+-- count is capped.
+local _layout_plans     = setmetatable({}, { __mode = "k" })
+local MAX_PLANS_PER_CFG = 8
+
+-- Appends the scalar fields of `t`, in key order, to `parts`. Returns false
+-- when `t` holds a non-scalar value, which cannot be part of a stable key.
+local function _appendScalars(parts, t)
+    if not t then return true end
+    local keys = {}
+    for k in pairs(t) do keys[#keys + 1] = k end
+    table.sort(keys)
+    for _i, k in ipairs(keys) do
+        local v = t[k]
+        local kind = type(v)
+        if kind ~= "string" and kind ~= "number" and kind ~= "boolean" then return false end
+        parts[#parts + 1] = k .. "=" .. tostring(v)
+    end
+    return true
+end
+
+-- Key of a layout plan: the geometry inputs in `parts` plus every field of
+-- the book data and book stats the text column is built from. nil when the
+-- inputs cannot be keyed.
+local function _layoutPlanKey(parts, book_data, book_stats)
+    if not _appendScalars(parts, book_data) or not _appendScalars(parts, book_stats) then
+        return nil
+    end
+    return table.concat(parts, "\31")
+end
+
+local function _findLayoutPlan(cfg, key)
+    local entry = _layout_plans[cfg]
+    return entry and entry.plans[key]
+end
+
+local function _storeLayoutPlan(cfg, key, plan)
+    local entry = _layout_plans[cfg]
+    if not entry or entry.count >= MAX_PLANS_PER_CFG then
+        entry = { count = 0, plans = {} }
+        _layout_plans[cfg] = entry
+    end
+    entry.plans[key] = plan
+    entry.count = entry.count + 1
+end
+
+-- Description text alignment. "justify" stretches word spacing to fill each
+-- line and keeps the last line of every paragraph left-aligned.
+local DESC_ALIGN_KEY     = "currently_description_align"
+local DESC_ALIGN_VALUES  = { "left", "right", "justify" }
+local DESC_ALIGN_DEFAULT = "justify"
+
+local function resolveDescAlign(stored)
+    return Config.resolveChoice(stored, DESC_ALIGN_VALUES, DESC_ALIGN_DEFAULT)
+end
+
 -- Setting key for progress bar style: "simple" (default) or "with_pct"
 local BAR_STYLE_KEY = "currently_bar_style"
 
@@ -122,16 +183,17 @@ end
 local function applyProgressBadge(cover, bd, cw, ch, pfx)
     local SH = getSH()
     if not SH or not SH.applyProgressBadge then return cover end
-    return SH.applyProgressBadge(cover, bd, cw, ch,
-        getProgressBadgeColorOverride(pfx), nil, nil,
-        Config.getBadgeScalePct("currently", pfx))
+    return SH.applyProgressBadge(cover, bd, cw, ch, {
+        color     = getProgressBadgeColorOverride(pfx),
+        scale_pct = Config.getBadgeScalePct("currently", pfx),
+    })
 end
 
 -- Setting key for stats layout: "default" (one line per stat) or "compact" (single row with · separator + ETA)
 local STATS_STYLE_KEY = "currently_stats_style"
 
 local function getStatsStyle(pfx)
-    return SUISettings:readSetting(pfx .. STATS_STYLE_KEY) or "default"
+    return SUISettings:readSetting(pfx .. STATS_STYLE_KEY) or "compact"
 end
 
 local COVER_GAP_KEY = "currently_cover_gap"
@@ -480,17 +542,6 @@ local function _computeCoverDims(w, thumb_scale, ratio)
     return cover_w, cover_h
 end
 
--- True when frame or module backdrop (>0) needs outer padding.
-local function _hasBox(pfx)
-    if SUISettings:isTrue(pfx .. "currently_show_frame") then return true end
-    local ok, WP = pcall(require, "features/sui_wallpaper")
-    if ok and WP and WP.getModuleBackdropStrength then
-        return WP.getModuleBackdropStrength(pfx, "currently") > 0
-    end
-    return SUISettings:isTrue(pfx .. "currently_solid_bg")
-end
-
-
 -- Clears the entire stats cache. Called from main.lua:onCloseDocument as a
 -- fallback when the closed book's md5 could not be resolved; safe since
 -- fetchBookStats() re-populates entries on demand.
@@ -579,13 +630,6 @@ function M.build(w, ctx)
     local lf          = ctx.landscape_factor or 1
     local raw_scale   = c and c.scale       or Config.getModuleScale("currently", pfx)
     local scale       = raw_scale * lf
-    -- Frame border / solid background — same optional box every other
-    -- homescreen module offers (module_heatmap.lua, module_reading_goals.lua):
-    -- a border, a filled background, or both, each adding PAD to every edge.
-    -- Computed up front so tw0 below already reserves room for the border,
-    -- keeping the box's real outer width equal to `w`.
-    -- Chrome applied by ModuleChrome on the homescreen.
-    local box = { inset_h = 0, inset_v = 0, outer_margin = 0 }
     local raw_thumb_scale = c and c.thumb_scale or Config.getThumbScale("currently", pfx)
     local lbl_scale   = (c and c.lbl_scale   or Config.getItemLabelScale("currently", pfx)) * lf
     local bar_style   = c and c.bar_style   or getBarStyle(pfx)
@@ -604,6 +648,7 @@ function M.build(w, ctx)
     }
     -- elem_order: use cached raw value from bundle; resolve lazily.
     local elem_order  = _resolveElemOrder(c and c.elem_order or SUISettings:readSetting(pfx .. ELEM_ORDER_KEY))
+    local desc_align  = resolveDescAlign(c and c.desc_align or SUISettings:readSetting(pfx .. DESC_ALIGN_KEY))
 
     -- Base cover size, as a percentage of the module's own width `w` — see
     -- _computeCoverDims. Used as-is by "default"; "dynamic" grows/shrinks
@@ -667,7 +712,7 @@ function M.build(w, ctx)
     -- computed from the base cover size (D.COVER_W). When dynamic cover
     -- sizing is enabled, the final width used for the text column may
     -- differ — see the two-pass layout below.
-    local tw0 = w - D.COVER_W - cover_gap - box.inset_h
+    local tw0 = w - D.COVER_W - cover_gap
 
     -- Fetch stats once if any stats element is active.
     local bstats
@@ -834,6 +879,8 @@ function M.build(w, ctx)
                 face      = face_desc,
                 bold      = FB.desc,
                 width     = tw,
+                alignment = desc_align == "right" and "right" or "left",
+                justified = desc_align == "justify",
                 height    = desc_tbw_line_h * desc_max_lines,
                 height_adjust = true,
                 height_overflow_show_ellipsis = true,
@@ -1057,85 +1104,107 @@ function M.build(w, ctx)
     -- Both layouts share the exact same single-column build path (see
     -- buildMetaColumn above); the only difference is whether the cover
     -- additionally grows to match the text column, below.
-    local cover_w, cover_h = D.COVER_W, D.COVER_H
-    local tw               = tw0
-
-    -- Pass 1: build at the base width to measure the text column's natural
-    -- height. Measuring by asking the VerticalGroup itself (rather than
-    -- summing known element heights) is the only reliable way, since
-    -- TextWidget line heights depend on font metrics, not just the font
-    -- size number.
-    local meta, _cr_update_funcs, _cr_bd_only_funcs = buildMetaColumn(tw0)
-    local meta_h = meta:getSize().h
-
     local dynamic_cover = (layout == "dynamic")
 
-    if dynamic_cover and meta_h > 0 then
-        -- Grow (or shrink) the cover so its height matches the text
-        -- column's height, preserving the cover's aspect ratio, then apply
-        -- the "Cover size" (raw_thumb_scale) setting as a multiplier ON TOP of
-        -- that dynamic height. This makes the Cover size stepper still do
-        -- something useful while Dynamic Cover Size is on: instead of being
-        -- ignored (thumb_scale used to only affect D.COVER_W/H, which this
-        -- branch overwrote entirely), each step grows/shrinks the cover
-        -- relative to whatever size the dynamic layout would otherwise pick
-        -- at that moment. cover_gap is untouched — only the cover's own box
-        -- changes size.
-        --
-        -- IMPORTANT (landscape): meta_h is the measured height of the text
-        -- column, which was already built using `scale`/`lbl_scale` — both
-        -- of which have `lf` (landscape_factor) folded in. Multiplying
-        -- meta_h by the lf-inclusive `thumb_scale` would apply lf a SECOND
-        -- time (effectively lf² instead of lf), collapsing the dynamic
-        -- cover far more than intended in landscape. Use the RAW thumb
-        -- scale (the user's Cover size % on its own) instead — same "RAW
-        -- getters, value already narrowed upstream" pattern documented in
-        -- sui_book_grid.lua's build() for the same reason.
-        --
-        -- A floor is applied so the cover can never shrink below its base
-        -- 100%-cover-size (the size used when Dynamic Cover Size is off and
-        -- Cover size = 100%), no matter how little vertical space the text
-        -- column ends up needing. min_cover_h uses the same percentage-of-`w`
-        -- formula as the base size, with thumb_scale pinned to 1.0 (100%).
-        local ratio        = D.COVER_W / D.COVER_H  -- scale-invariant aspect ratio
-        local _, min_cover_h = _computeCoverDims(w, 1.0, _cover_ratio)
-        local new_cover_h  = math.max(min_cover_h, math.floor(meta_h * raw_thumb_scale))
-        local new_cover_w  = math.max(1, math.floor(new_cover_h * ratio))
-        if new_cover_w ~= cover_w or new_cover_h ~= cover_h then
-            cover_w, cover_h = new_cover_w, new_cover_h
-            tw = math.max(1, w - cover_w - cover_gap - box.inset_h)
-            -- Pass 2: rebuild the text column at the corrected width now
-            -- that the cover (and thus the space left for text) changed
-            -- size. Height cannot change between passes (see comment on
-            -- buildMetaColumn above), so meta_h from pass 1 stays valid —
-            -- no further passes or re-measuring needed.
-            meta, _cr_update_funcs, _cr_bd_only_funcs = buildMetaColumn(tw)
+    -- Resolves the final cover size and text column. Pass 1 builds at the base
+    -- width to measure the text column's natural height. Measuring by asking
+    -- the VerticalGroup itself (rather than summing known element heights) is
+    -- the only reliable way, since TextWidget line heights depend on font
+    -- metrics, not just the font size number.
+    -- Returns the plan (see _layout_plans) followed by the built column.
+    local function resolveLayout()
+        local cover_w, cover_h = D.COVER_W, D.COVER_H
+        local tw               = tw0
+        local meta_opts
+        local meta, update_funcs, bd_only_funcs = buildMetaColumn(tw0)
+        local meta_h = meta:getSize().h
+
+        if dynamic_cover and meta_h > 0 then
+            -- Grow (or shrink) the cover so its height matches the text
+            -- column's height, preserving the cover's aspect ratio, then apply
+            -- the "Cover size" (raw_thumb_scale) setting as a multiplier ON TOP of
+            -- that dynamic height. This makes the Cover size stepper still do
+            -- something useful while Dynamic Cover Size is on: instead of being
+            -- ignored (thumb_scale used to only affect D.COVER_W/H, which this
+            -- branch overwrote entirely), each step grows/shrinks the cover
+            -- relative to whatever size the dynamic layout would otherwise pick
+            -- at that moment. cover_gap is untouched — only the cover's own box
+            -- changes size.
+            --
+            -- IMPORTANT (landscape): meta_h is the measured height of the text
+            -- column, which was already built using `scale`/`lbl_scale` — both
+            -- of which have `lf` (landscape_factor) folded in. Multiplying
+            -- meta_h by the lf-inclusive `thumb_scale` would apply lf a SECOND
+            -- time (effectively lf² instead of lf), collapsing the dynamic
+            -- cover far more than intended in landscape. Use the RAW thumb
+            -- scale (the user's Cover size % on its own) instead — same "RAW
+            -- getters, value already narrowed upstream" pattern documented in
+            -- sui_book_grid.lua's build() for the same reason.
+            --
+            -- A floor is applied so the cover can never shrink below its base
+            -- 100%-cover-size (the size used when Dynamic Cover Size is off and
+            -- Cover size = 100%), no matter how little vertical space the text
+            -- column ends up needing. min_cover_h uses the same percentage-of-`w`
+            -- formula as the base size, with thumb_scale pinned to 1.0 (100%).
+            local ratio        = D.COVER_W / D.COVER_H  -- scale-invariant aspect ratio
+            local _, min_cover_h = _computeCoverDims(w, 1.0, _cover_ratio)
+            local new_cover_h  = math.max(min_cover_h, math.floor(meta_h * raw_thumb_scale))
+            local new_cover_w  = math.max(1, math.floor(new_cover_h * ratio))
+            if new_cover_w ~= cover_w or new_cover_h ~= cover_h then
+                cover_w, cover_h = new_cover_w, new_cover_h
+                tw = math.max(1, w - cover_w - cover_gap)
+                -- Pass 2: rebuild the text column at the corrected width now
+                -- that the cover (and thus the space left for text) changed
+                -- size. Height cannot change between passes (see comment on
+                -- buildMetaColumn above), so meta_h from pass 1 stays valid —
+                -- no further passes or re-measuring needed.
+                meta, update_funcs, bd_only_funcs = buildMetaColumn(tw)
+            end
+
+        elseif not dynamic_cover and meta_h > cover_h then
+            -- Anchor the text column to the cover's height in "default": the
+            -- cover's own size is authoritative and the text column must
+            -- never grow taller than it. The description is the sole elastic
+            -- element (title/author/series/progress/stats keep their natural
+            -- size); it shrinks to whatever room is left, or is omitted
+            -- entirely if there isn't enough room for even one line.
+            if show.description and bd.description and bd.description ~= "" then
+                -- Measure every OTHER element's height first (description
+                -- suppressed), so we know exactly how much room is left for it.
+                local other_h = buildMetaColumn(tw0, { suppress_description = true }):getSize().h
+                local breath  = math.max(1, desc_gap)
+                local available = cover_h - other_h - breath
+                local desc_line_h = math.floor(1.3 * face_desc.size + 0.5)
+                local new_desc_lines = (available >= face_desc.size)
+                    and math.max(1, math.floor(available / desc_line_h)) or 0
+                meta_opts = { desc_max_lines = new_desc_lines }
+                meta, update_funcs, bd_only_funcs = buildMetaColumn(tw0, meta_opts)
+                meta_h = meta:getSize().h
+            end
+            -- If there's no description to shrink (or it's disabled/empty),
+            -- meta_h simply stays as measured — the module falls back to
+            -- growing past the cover rather than clipping fixed-size content.
         end
 
-    elseif not dynamic_cover and meta_h > cover_h then
-        -- Anchor the text column to the cover's height in "default": the
-        -- cover's own size is authoritative and the text column must
-        -- never grow taller than it. The description is the sole elastic
-        -- element (title/author/series/progress/stats keep their natural
-        -- size); it shrinks to whatever room is left, or is omitted
-        -- entirely if there isn't enough room for even one line.
-        if show.description and bd.description and bd.description ~= "" then
-            -- Measure every OTHER element's height first (description
-            -- suppressed), so we know exactly how much room is left for it.
-            local other_h = buildMetaColumn(tw0, { suppress_description = true }):getSize().h
-            local breath  = math.max(1, desc_gap)
-            local available = cover_h - other_h - breath
-            local desc_line_h = math.floor(1.3 * face_desc.size + 0.5)
-            local new_desc_lines = (available >= face_desc.size)
-                and math.max(1, math.floor(available / desc_line_h)) or 0
-            meta, _cr_update_funcs, _cr_bd_only_funcs =
-                buildMetaColumn(tw0, { desc_max_lines = new_desc_lines })
-            meta_h = meta:getSize().h
-        end
-        -- If there's no description to shrink (or it's disabled/empty),
-        -- meta_h simply stays as measured — the module falls back to
-        -- growing past the cover rather than clipping fixed-size content.
+        return { cover_w = cover_w, cover_h = cover_h, tw = tw, meta_h = meta_h, meta_opts = meta_opts },
+               meta, update_funcs, bd_only_funcs
     end
+
+    -- A plan is only valid for identical inputs: the settings bundle (its
+    -- identity), the geometry below, and the book data and stats scalars.
+    local plan_key = c and _layoutPlanKey({
+        w, lf, raw_scale, raw_thumb_scale, lbl_scale, layout, cover_gap,
+        _cover_ratio, ctx.has_wallpaper and 1 or 0, series_text,
+    }, bd, bstats)
+    local plan = plan_key and _findLayoutPlan(c, plan_key)
+    local meta, _cr_update_funcs, _cr_bd_only_funcs
+    if plan then
+        meta, _cr_update_funcs, _cr_bd_only_funcs = buildMetaColumn(plan.tw, plan.meta_opts)
+    else
+        plan, meta, _cr_update_funcs, _cr_bd_only_funcs = resolveLayout()
+        if plan_key then _storeLayoutPlan(c, plan_key, plan) end
+    end
+    local cover_w, cover_h, tw, meta_h = plan.cover_w, plan.cover_h, plan.tw, plan.meta_h
 
     local content_h = math.max(cover_h, meta_h)
 
@@ -1444,35 +1513,11 @@ function M.getHeight(_ctx)
     else
         content_h = math.max(D.COVER_H, text_h_no_desc)
     end
-    if _hasBox(pfx) then
-        -- Mirrors build()'s FrameContainer: bordersize is drawn outside the
-        -- padding, so the border itself (not just the padding) grows the
-        -- real widget by border_sz * 2 pixels whenever the frame is on.
-        content_h = content_h + PAD * 2
-        if SUISettings:isTrue(pfx .. "currently_show_frame") then
-            content_h = content_h + SUIStyle.BORDER_SZ * 2
-        end
-    end
+    -- The module chrome adds its padding and border around the content.
+    content_h = content_h + Chrome.boxInset(Chrome.resolve(pfx, M.id))
     return SectionLabel.height(M.id, lf) + content_h
 end
 
-
--- Builds one radio-button item for a persisted string-valued setting, e.g.
--- one option of "Progress bar style" or "Stats layout". Used to avoid
--- repeating the same checked_func/callback shape for every option of every
--- such setting.
-local function _makeStyleRadioItem(text, key, value, get_current, refresh)
-    return {
-        text           = text,
-        radio          = true,
-        keep_menu_open = true,
-        checked_func   = function() return get_current() == value end,
-        callback       = function()
-            SUISettings:saveSetting(key, value)
-            refresh()
-        end,
-    }
-end
 
 -- Settings menu helpers (scale, text size, cover size).
 local function _makeScaleItem(ctx_menu)
@@ -1528,24 +1573,20 @@ end
 local function _makeLayoutItem(ctx_menu)
     local pfx = ctx_menu.pfx
     local _lc = ctx_menu._
-    return {
-        text           = _lc("Layout"),
-        separator      = true,
-        sub_item_table = {
-            _makeStyleRadioItem(_lc("Default"), pfx .. LAYOUT_KEY, "default",
-                function() return getLayout(pfx) end, ctx_menu.refresh),
+    return Config.makeRadioSubmenuItem{
+        text      = _lc("Layout"),
+        separator = true,
+        options   = {
+            { value = "default", label = _lc("Default") },
             {
-                text           = _lc("Dynamic"),
-                radio          = true,
-                keep_menu_open = true,
-                checked_func   = function() return getLayout(pfx) == "dynamic" end,
-                callback       = function()
-                    SUISettings:saveSetting(pfx .. LAYOUT_KEY, "dynamic")
-                    ctx_menu.refresh()
-                end,
+                value     = "dynamic",
+                label     = _lc("Dynamic"),
                 help_text = _lc("Grows or shrinks the cover so its height always matches the text column, keeping the cover's proportions.\nThe spacing between cover and text stays as set above.\nThe Cover size setting still applies on top of this, and the cover never shrinks below its 100% size."),
             },
         },
+        get       = function() return getLayout(pfx) end,
+        set       = function(v) SUISettings:saveSetting(pfx .. LAYOUT_KEY, v) end,
+        refresh   = ctx_menu.refresh,
     }
 end
 
@@ -2028,23 +2069,25 @@ function M.getMenuItems(ctx_menu)
     local progress_stats_entry = {
             text_func      = function() return _lc("Progress and Stats") end,
             sub_item_table = {
-                {
-                    text = _lc("Progress bar style"),
-                    sub_item_table = {
-                        _makeStyleRadioItem(_lc("Simple"), pfx .. BAR_STYLE_KEY, "simple",
-                            function() return getBarStyle(pfx) end, refresh),
-                        _makeStyleRadioItem(_lc("With percentage"), pfx .. BAR_STYLE_KEY, "with_pct",
-                            function() return getBarStyle(pfx) end, refresh),
+                Config.makeRadioSubmenuItem{
+                    text    = _lc("Progress bar style"),
+                    options = {
+                        { value = "simple",   label = _lc("Simple") },
+                        { value = "with_pct", label = _lc("With percentage") },
                     },
+                    get     = function() return getBarStyle(pfx) end,
+                    set     = function(v) SUISettings:saveSetting(pfx .. BAR_STYLE_KEY, v) end,
+                    refresh = refresh,
                 },
-                {
-                    text = _lc("Stats layout"),
-                    sub_item_table = {
-                        _makeStyleRadioItem(_lc("Default"), pfx .. STATS_STYLE_KEY, "default",
-                            function() return getStatsStyle(pfx) end, refresh),
-                        _makeStyleRadioItem(_lc("Compact"), pfx .. STATS_STYLE_KEY, "compact",
-                            function() return getStatsStyle(pfx) end, refresh),
+                Config.makeRadioSubmenuItem{
+                    text    = _lc("Stats layout"),
+                    options = {
+                        { value = "default", label = _lc("Detailed") },
+                        { value = "compact", label = _lc("Compact") },
                     },
+                    get     = function() return getStatsStyle(pfx) end,
+                    set     = function(v) SUISettings:saveSetting(pfx .. STATS_STYLE_KEY, v) end,
+                    refresh = refresh,
                 },
                 {
                     text_func  = function() return _lc("Progress Badge") end,
@@ -2069,7 +2112,7 @@ function M.getMenuItems(ctx_menu)
             keep_menu_open = true,
             callback       = function()
                 local SP = package.loaded["modules/module_stats_provider"]
-                if SP and SP.invalidate then SP.invalidate() end
+                if SP and SP.rescanBooks then SP.rescanBooks() end
                 local SH = package.loaded["modules/module_books_shared"]
                 if SH and SH.invalidateSidecarCache then SH.invalidateSidecarCache() end
                 local MC = package.loaded["modules/module_currently"]
@@ -2087,6 +2130,15 @@ function M.getMenuItems(ctx_menu)
     }
 
     local appearance_extra = {
+        Config.makeAlignmentItem{
+            key          = pfx .. DESC_ALIGN_KEY,
+            values       = DESC_ALIGN_VALUES,
+            default      = DESC_ALIGN_DEFAULT,
+            text         = _lc("Description Alignment"),
+            enabled_func = function() return _showElem(pfx, "description") end,
+            refresh      = refresh,
+            _lc          = _lc,
+        },
         Config.makeLabelToggleItem("currently", refresh, _lc),
     }
 
