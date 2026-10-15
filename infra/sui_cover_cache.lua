@@ -106,6 +106,7 @@ local SUICoverCache = {
     _bytes       = 0,   -- running sum of resident entry bytes (see _sizes)
     _count       = 0,   -- number of resident entries
     _cache       = {},  -- filepath -> bb
+    _revisions   = {},  -- filepath -> count of covers installed into an empty slot
     _ticks       = {},  -- filepath -> tick of the last access (higher = more recent)
     _sizes       = {},  -- filepath -> bytes, so evict/replace adjust _bytes O(1)
     _tick        = 0,   -- monotonic access counter
@@ -190,6 +191,14 @@ function SUICoverCache:get(filepath)
     return bb
 end
 
+-- revision(filepath) — identifies the cover currently cached for filepath.
+-- It changes when a cover is installed into an empty slot (first load, or
+-- after an eviction or drop) and stays put when put() only enlarges it, so
+-- derived rasters stay valid across enlargements and are rebuilt otherwise.
+function SUICoverCache:revision(filepath)
+    return self._revisions[filepath] or 0
+end
+
 -- has(filepath) — boolean probe. Doesn't touch MRU order or counters. Lets
 -- a caller skip a slow BookInfoManager decode when the cover is already
 -- resident (the cache-first check should still call get() to actually use
@@ -240,6 +249,11 @@ function SUICoverCache:put(filepath, bb)
         -- top of this file). Drop the old entry's accounting; the new
         -- entry's is added below.
         self:_removeEntry(filepath)
+    end
+    -- A cover installed into an empty slot may differ from the previous one;
+    -- an upgrade above only enlarges the same cover and keeps the revision.
+    if not existing then
+        self._revisions[filepath] = (self._revisions[filepath] or 0) + 1
     end
     local nbytes = _bbBytes(bb)
     self._cache[filepath] = bb

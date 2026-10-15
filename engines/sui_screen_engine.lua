@@ -1589,18 +1589,20 @@ function ScreenWidget:_buildCtx()
                 bar_style   = SUISettings:readSetting(self._pfx .. "currently_bar_style"),
                 stats_style = SUISettings:readSetting(self._pfx .. "currently_stats_style"),
                 layout      = SUISettings:readSetting(self._pfx .. "currently_layout") == "dynamic" and "dynamic" or "default",
-                elem_order  = SUISettings:readSetting(self._pfx .. "currently_elem_order"),
+                main_order  = SUISettings:readSetting(self._pfx .. "currently_main_order"),
+                stats_order = SUISettings:readSetting(self._pfx .. "currently_stats_order"),
                 desc_align  = SUISettings:readSetting(self._pfx .. "currently_description_align"),
                 show = {
-                    title    = SUISettings:nilOrTrue(self._pfx .. "currently_show_title"),
-                    author   = SUISettings:nilOrTrue(self._pfx .. "currently_show_author"),
-                    progress = SUISettings:nilOrTrue(self._pfx .. "currently_show_progress"),
-                    percent  = SUISettings:nilOrTrue(self._pfx .. "currently_show_percent"),
-                    days     = SUISettings:nilOrTrue(self._pfx .. "currently_show_book_days"),
-                    time     = SUISettings:nilOrTrue(self._pfx .. "currently_show_book_time"),
-                    remain   = SUISettings:nilOrTrue(self._pfx .. "currently_show_book_remaining"),
+                    title       = SUISettings:nilOrTrue(self._pfx .. "currently_show_title"),
+                    author      = SUISettings:nilOrTrue(self._pfx .. "currently_show_author"),
                     series      = SUISettings:nilOrTrue(self._pfx .. "currently_show_series"),
                     description = SUISettings:nilOrTrue(self._pfx .. "currently_show_description"),
+                    progress    = SUISettings:nilOrTrue(self._pfx .. "currently_show_progress"),
+                    stats       = SUISettings:nilOrTrue(self._pfx .. "currently_show_stats"),
+                    percent        = SUISettings:nilOrTrue(self._pfx .. "currently_show_percent"),
+                    book_days      = SUISettings:nilOrTrue(self._pfx .. "currently_show_book_days"),
+                    book_time      = SUISettings:nilOrTrue(self._pfx .. "currently_show_book_time"),
+                    book_remaining = SUISettings:nilOrTrue(self._pfx .. "currently_show_book_remaining"),
                 },
             },
             coverdeck = {
@@ -1786,13 +1788,7 @@ function ScreenWidget:_buildCtx()
     -- hot paint path (md5 is already in prefetched_data — no extra IO).
     local currently_book_stats = nil
     if mod_c and Registry.isEnabled(mod_c, self._pfx) and self._db_conn and bs.current_fp then
-        local c_cfg = cfg and cfg.currently
-        local needs_bstats = (c_cfg and (c_cfg.show.days or c_cfg.show.time or c_cfg.show.remain))
-            or (not c_cfg and (
-                SUISettings:nilOrTrue(self._pfx .. "currently_show_book_days") or
-                SUISettings:nilOrTrue(self._pfx .. "currently_show_book_time") or
-                SUISettings:nilOrTrue(self._pfx .. "currently_show_book_remaining")))
-        if needs_bstats then
+        if mod_c.needsDbStats(cfg.currently.show) then
             local pe_c  = bs.prefetched_data and bs.prefetched_data[bs.current_fp]
             local c_md5 = type(pe_c) == "table" and pe_c.partial_md5_checksum
             if c_md5 then
